@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=65", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bt_api_transport_zmq"
+version = "0.1.0"
+description = "Versioned, authenticated ZeroMQ transport primitives for bt_api gateways"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [{name = "cloudQuant", email = "yunjinqi@gmail.com"}]
+dependencies = ["pyzmq>=25"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "ruff>=0.1.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "N", "UP", "B", "C4", "SIM", "TCH", "RUF100", "S", "PERF", "PIE790"]
+ignore = ["E501", "S101", "TC001", "TC002", "TC003", "PERF203"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S106"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
