@@ -4,6 +4,7 @@ import queue
 import socket
 import threading
 import time
+from contextlib import suppress
 from typing import Any, Optional
 
 import pytest
@@ -26,14 +27,17 @@ from nacl.public import PrivateKey, PublicKey, SealedBox
 from zmq.auth.thread import ThreadAuthenticator
 from zmq.utils import z85
 
+from bt_api_transport_zmq import service_v2
 from bt_api_transport_zmq.server import CurveClientCredentials, CurveServerCredentials
 from bt_api_transport_zmq.service_v2 import (
     RequestNotSentError,
     RequestOutcomeUnknownError,
     ServiceTransportError,
+    ServiceTransportStartupCleanupError,
     ZmqServiceClient,
     ZmqServiceServer,
     _make_reply,
+    validate_service_server_configuration,
 )
 
 _SEALED_REPLY_PREFIX = b"BTAPI-ZMQ-REPLY-V2\x00"
@@ -934,6 +938,394 @@ def test_server_and_client_require_authenticated_tcp_and_service_identity() -> N
             _identity(WireRole.STRATEGY_CLIENT, "not-service", "actor-a"),
             credentials=credentials,
         )
+
+
+def test_service_server_configuration_preflight_is_pure_and_rejects_bad_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server_public, server_secret = zmq.curve_keypair()
+    client_public, _client_secret = zmq.curve_keypair()
+    identity = _identity(WireRole.SERVICE, "service-a", "gateway-a")
+    credentials = CurveServerCredentials(server_public, server_secret)
+    principals = {client_public: "principal-a"}
+    resource_calls = []
+
+    def forbidden_resource_creation(*_args: Any, **_kwargs: Any) -> None:
+        resource_calls.append(True)
+        raise AssertionError("configuration preflight must not create resources")
+
+    monkeypatch.setattr(service_v2.zmq, "Context", forbidden_resource_creation)
+    monkeypatch.setattr(service_v2, "ThreadAuthenticator", forbidden_resource_creation)
+
+    assert (
+        validate_service_server_configuration(
+            "tcp://127.0.0.1:*",
+            identity,
+            principals,
+            credentials=credentials,
+        )
+        is None
+    )
+    with pytest.raises(ValueError, match="not valid Z85"):
+        validate_service_server_configuration(
+            "tcp://127.0.0.1:*",
+            identity,
+            {b"\x00" * 40: "principal-a"},
+            credentials=credentials,
+        )
+    other_public, _other_secret = zmq.curve_keypair()
+    with pytest.raises(ValueError, match="public and secret keys do not match"):
+        validate_service_server_configuration(
+            "tcp://127.0.0.1:*",
+            identity,
+            principals,
+            credentials=CurveServerCredentials(server_public, other_public),
+        )
+    with pytest.raises(ValueError, match="high_water_mark"):
+        validate_service_server_configuration(
+            "tcp://127.0.0.1:*",
+            identity,
+            principals,
+            credentials=credentials,
+            high_water_mark=0,
+        )
+
+    with pytest.raises(ValueError, match="public and secret keys do not match"):
+        ZmqServiceServer(
+            "tcp://127.0.0.1:*",
+            identity,
+            principals,
+            lambda *_: {},
+            credentials=CurveServerCredentials(server_public, other_public),
+        )
+    assert resource_calls == []
+
+
+@pytest.mark.parametrize("startup_error", [RuntimeError, KeyboardInterrupt])
+def test_server_startup_cleanup_failure_returns_retryable_transport(
+    monkeypatch: pytest.MonkeyPatch,
+    startup_error: type[BaseException],
+) -> None:
+    server_public, server_secret = zmq.curve_keypair()
+    client_public, _credentials = _client_credentials(server_public)
+    credentials = CurveServerCredentials(server_public, server_secret)
+    identity = _identity(WireRole.SERVICE, "service-a", "gateway-a")
+
+    def install_startup_fakes(*, fail_auth_stop_once: bool) -> dict[str, Any]:
+        events = []
+        state: dict[str, Any] = {"events": events}
+
+        class FakeSocket:
+            def __init__(self) -> None:
+                self.close_calls = 0
+                self.closed = False
+
+            def setsockopt(self, *_args: Any) -> None:
+                return None
+
+            def bind(self, _endpoint: str) -> None:
+                events.append("socket.bind")
+                raise startup_error("injected bind failure")
+
+            def close(self, *, linger: int) -> None:
+                assert linger == 0
+                self.close_calls += 1
+                events.append("socket.close")
+                self.closed = True
+
+        class FakeContext:
+            def __init__(self) -> None:
+                self.socket_object = FakeSocket()
+                self.term_calls = 0
+                self.terminated = False
+
+            def socket(self, _socket_type: int) -> FakeSocket:
+                events.append("context.socket")
+                return self.socket_object
+
+            def term(self) -> None:
+                self.term_calls += 1
+                events.append("context.term")
+                self.terminated = True
+
+        class FakeAuthenticator:
+            def __init__(self, _context: FakeContext) -> None:
+                self.stop_calls = 0
+                self.stopped = False
+
+            def configure_curve_callback(self, **_kwargs: Any) -> None:
+                events.append("auth.configure")
+
+            def start(self) -> None:
+                events.append("auth.start")
+
+            def stop(self) -> None:
+                self.stop_calls += 1
+                if fail_auth_stop_once and self.stop_calls == 1:
+                    events.append("auth.stop.failed")
+                    raise RuntimeError("injected authenticator stop failure")
+                events.append("auth.stop")
+                self.stopped = True
+
+        def make_context() -> FakeContext:
+            events.append("context.create")
+            context = FakeContext()
+            state.update(context=context, socket=context.socket_object)
+            return context
+
+        def make_authenticator(context: FakeContext) -> FakeAuthenticator:
+            events.append("auth.create")
+            authenticator = FakeAuthenticator(context)
+            state["authenticator"] = authenticator
+            return authenticator
+
+        monkeypatch.setattr(service_v2.zmq, "Context", make_context)
+        monkeypatch.setattr(service_v2, "ThreadAuthenticator", make_authenticator)
+        return state
+
+    partial = install_startup_fakes(fail_auth_stop_once=True)
+    with pytest.raises(ServiceTransportStartupCleanupError) as caught:
+        ZmqServiceServer(
+            "tcp://127.0.0.1:*",
+            identity,
+            {client_public: "principal-a"},
+            lambda *_: {},
+            credentials=credentials,
+        )
+    transport = caught.value.transport
+    assert transport is not None
+    assert caught.value.cause_code == "startup_cleanup_failed"
+    assert str(caught.value) == "service transport startup cleanup failed; retry close"
+    assert transport._closed is False
+    assert transport._close_pending is True
+    assert transport._authenticator is partial["authenticator"]
+    assert transport._socket is partial["socket"]
+    assert transport._context is partial["context"]
+    assert partial["authenticator"].stop_calls == 1
+    assert partial["socket"].close_calls == 0
+    assert partial["context"].term_calls == 0
+    assert partial["events"][-1] == "auth.stop.failed"
+    with pytest.raises(RuntimeError, match="server is closed"):
+        transport.serve_once(0)
+
+    transport.close()
+    assert transport._closed is True
+    assert transport._close_pending is False
+    assert transport._authenticator is None
+    assert transport._socket is None
+    assert transport._receiver is None
+    assert transport._context is None
+    assert partial["authenticator"].stop_calls == 2
+    assert partial["authenticator"].stopped is True
+    assert partial["socket"].close_calls == 1
+    assert partial["socket"].closed is True
+    assert partial["context"].term_calls == 1
+    assert partial["context"].terminated is True
+    assert partial["events"][-3:] == ["auth.stop", "socket.close", "context.term"]
+
+    normal = install_startup_fakes(fail_auth_stop_once=False)
+    with pytest.raises(startup_error, match="injected bind failure"):
+        ZmqServiceServer(
+            "tcp://127.0.0.1:*",
+            identity,
+            {client_public: "principal-a"},
+            lambda *_: {},
+            credentials=credentials,
+        )
+    assert normal["authenticator"].stop_calls == 1
+    assert normal["authenticator"].stopped is True
+    assert normal["socket"].close_calls == 1
+    assert normal["socket"].closed is True
+    assert normal["context"].term_calls == 1
+    assert normal["context"].terminated is True
+    assert normal["events"][-4:] == [
+        "socket.bind",
+        "auth.stop",
+        "socket.close",
+        "context.term",
+    ]
+
+
+def test_server_close_retries_only_unresolved_resources_on_owner_thread() -> None:
+    server_public, server_secret = zmq.curve_keypair()
+    client_public, _credentials = _client_credentials(server_public)
+    server = ZmqServiceServer(
+        "tcp://127.0.0.1:*",
+        _identity(WireRole.SERVICE, "service-a", "gateway-a"),
+        {client_public: "principal-a"},
+        lambda *_: {"ok": True, "code": "OK", "result": {}},
+        credentials=CurveServerCredentials(server_public, server_secret),
+    )
+    raw_authenticator = server._authenticator
+    raw_socket = server._socket
+    raw_context = server._context
+    receiver = server._receiver
+
+    class FailOnceAuthenticator:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def stop(self) -> None:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("injected authenticator stop failure")
+            raw_authenticator.stop()
+
+    class FailOnceSocket:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def close(self, *, linger: int) -> None:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("injected socket close failure")
+            raw_socket.close(linger=linger)
+
+    class CountingContext:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def term(self) -> None:
+            self.calls += 1
+            raw_context.term()
+
+    authenticator = FailOnceAuthenticator()
+    sock = FailOnceSocket()
+    context = CountingContext()
+    server._authenticator = authenticator
+    server._socket = sock
+    server._context = context
+
+    try:
+        with pytest.raises(RuntimeError, match="authenticator stop failure"):
+            server.close()
+        assert server._closed is False
+        assert server._close_pending is True
+        assert server._authenticator is authenticator
+        assert server._socket is sock
+        assert server._receiver is receiver
+        assert server._context is context
+        assert authenticator.calls == 1
+        assert sock.calls == 0
+        assert context.calls == 0
+        assert raw_socket.closed is False
+        with pytest.raises(RuntimeError, match="server is closed"):
+            server.serve_once(0)
+
+        with pytest.raises(RuntimeError, match="socket close failure"):
+            server.close()
+        assert server._closed is False
+        assert server._authenticator is None
+        assert server._socket is sock
+        assert server._receiver is receiver
+        assert server._context is context
+        assert authenticator.calls == 2
+        assert sock.calls == 1
+        assert context.calls == 0
+        assert raw_socket.closed is False
+
+        server.close()
+        assert server._closed is True
+        assert server._close_pending is False
+        assert server._authenticator is None
+        assert server._socket is None
+        assert server._receiver is None
+        assert server._context is None
+        assert authenticator.calls == 2
+        assert sock.calls == 2
+        assert context.calls == 1
+        assert raw_socket.closed is True
+        assert raw_context.closed is True
+        server.close()
+        assert (authenticator.calls, sock.calls, context.calls) == (2, 2, 1)
+    finally:
+        for _ in range(3):
+            if server._closed:
+                break
+            with suppress(RuntimeError):
+                server.close()
+
+
+def test_client_close_retries_failed_socket_then_context() -> None:
+    server_public, _server_secret = zmq.curve_keypair()
+    _client_public, credentials = _client_credentials(server_public)
+    client = ZmqServiceClient(
+        "tcp://127.0.0.1:1",
+        _identity(WireRole.SERVICE, "service-a", "gateway-a"),
+        credentials=credentials,
+    )
+    raw_socket = client._socket
+    raw_context = client._context
+    receiver = client._receiver
+
+    class FailOnceSocket:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def close(self, *, linger: int) -> None:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("injected socket close failure")
+            raw_socket.close(linger=linger)
+
+    class FailOnceContext:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def term(self) -> None:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("injected context term failure")
+            raw_context.term()
+
+    sock = FailOnceSocket()
+    context = FailOnceContext()
+    client._socket = sock
+    client._context = context
+
+    try:
+        with pytest.raises(RuntimeError, match="socket close failure"):
+            client.close()
+        assert client._closed is False
+        assert client._close_pending is True
+        assert client._socket is sock
+        assert client._receiver is receiver
+        assert client._context is context
+        assert client._socket_retirement_pending is True
+        assert sock.calls == 1
+        assert context.calls == 0
+        assert raw_socket.closed is False
+        with pytest.raises(RuntimeError, match="client is closed"):
+            client.request(_request("during-close"), timeout=0.1)
+
+        with pytest.raises(RuntimeError, match="context term failure"):
+            client.close()
+        assert client._closed is False
+        assert client._socket is None
+        assert client._receiver is None
+        assert client._context is context
+        assert client._socket_retirement_pending is False
+        assert sock.calls == 2
+        assert context.calls == 1
+        assert raw_socket.closed is True
+
+        client.close()
+        assert client._closed is True
+        assert client._close_pending is False
+        assert client._socket is None
+        assert client._receiver is None
+        assert client._context is None
+        assert sock.calls == 2
+        assert context.calls == 2
+        assert raw_context.closed is True
+        client.close()
+        assert (sock.calls, context.calls) == (2, 2)
+    finally:
+        for _ in range(3):
+            if client._closed:
+                break
+            with suppress(RuntimeError):
+                client.close()
 
 
 def test_client_enforces_thread_affinity_and_close_is_idempotent() -> None:

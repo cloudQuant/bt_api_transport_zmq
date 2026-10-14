@@ -101,6 +101,15 @@ class ServiceTransportError(RuntimeError):
     """The authenticated v2 transport could not safely process an operation."""
 
 
+class ServiceTransportStartupCleanupError(ServiceTransportError):
+    """Startup failed and cleanup remains available for a same-thread retry."""
+
+    def __init__(self, transport: Any) -> None:
+        self.transport = transport
+        self.cause_code = "startup_cleanup_failed"
+        super().__init__("service transport startup cleanup failed; retry close")
+
+
 class RequestNotSentError(TimeoutError):
     """The request was not queued by ZeroMQ and can be retried with its ID."""
 
@@ -129,6 +138,57 @@ class _CurvePrincipalRegistry:
         return domain == _ZAP_DOMAIN and client_key in self._principals
 
 
+def validate_service_server_configuration(
+    endpoint: str,
+    identity: WireIdentity,
+    principals: Mapping[bytes, str],
+    *,
+    credentials: CurveServerCredentials,
+    high_water_mark: int = DEFAULT_HIGH_WATER_MARK,
+    max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES,
+) -> None:
+    """Validate v2 server inputs without creating ZeroMQ resources."""
+
+    _validated_service_server_configuration(
+        endpoint,
+        identity,
+        principals,
+        credentials=credentials,
+        high_water_mark=high_water_mark,
+        max_message_bytes=max_message_bytes,
+    )
+
+
+def _validated_service_server_configuration(
+    endpoint: str,
+    identity: WireIdentity,
+    principals: Mapping[bytes, str],
+    *,
+    credentials: CurveServerCredentials,
+    high_water_mark: int,
+    max_message_bytes: int,
+) -> tuple[Mapping[bytes, str], dict[bytes, PublicKey]]:
+    _validate_endpoint(endpoint)
+    if type(identity) is not WireIdentity or identity.role is not WireRole.SERVICE:
+        raise ValueError("service identity must have the service role")
+    if not isinstance(credentials, CurveServerCredentials):
+        raise ValueError("Curve server credentials are required")
+    _validate_limits(high_water_mark, max_message_bytes)
+    copied_principals = _copy_principals(principals)
+    try:
+        server_public_key = z85.decode(credentials.public_key)
+        server_secret_key = z85.decode(credentials.secret_key)
+        derived_public_key = bindings.crypto_scalarmult_base(server_secret_key)
+        reply_keys = {
+            public_key: PublicKey(z85.decode(public_key)) for public_key in copied_principals
+        }
+    except (KeyError, TypeError, ValueError, CryptoError) as exc:
+        raise ValueError("server or principal CURVE key is invalid") from exc
+    if derived_public_key != server_public_key:
+        raise ValueError("server CURVE public and secret keys do not match")
+    return copied_principals, reply_keys
+
+
 class ZmqServiceServer:
     """CURVE-authenticated ROUTER for one request/reply v2 service.
 
@@ -149,32 +209,31 @@ class ZmqServiceServer:
         high_water_mark: int = DEFAULT_HIGH_WATER_MARK,
         max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES,
     ) -> None:
-        _validate_endpoint(endpoint)
-        if type(identity) is not WireIdentity or identity.role is not WireRole.SERVICE:
-            raise ValueError("service identity must have the service role")
         if not callable(handler):
             raise ValueError("handler is required")
-        if not isinstance(credentials, CurveServerCredentials):
-            raise ValueError("Curve server credentials are required")
-        _validate_limits(high_water_mark, max_message_bytes)
+        copied_principals, reply_keys = _validated_service_server_configuration(
+            endpoint,
+            identity,
+            principals,
+            credentials=credentials,
+            high_water_mark=high_water_mark,
+            max_message_bytes=max_message_bytes,
+        )
         self._identity = identity
-        self._principals = _copy_principals(principals)
-        try:
-            self._reply_keys = {
-                public_key: PublicKey(z85.decode(public_key)) for public_key in self._principals
-            }
-        except (TypeError, ValueError, CryptoError) as exc:
-            raise ValueError("principal CURVE public key cannot encrypt replies") from exc
+        self._principals = copied_principals
+        self._reply_keys = reply_keys
         self._handler = handler
         self._max_message_bytes = max_message_bytes
         self._reply_envelope_max_bytes = max_message_bytes - _REPLY_FRAME_OVERHEAD
         self._owner_thread = threading.get_ident()
         self._closed = False
-        self._context = zmq.Context()
+        self._close_pending = False
+        self._context = None
         self._socket = None
         self._receiver = None
         self._authenticator = None
         try:
+            self._context = zmq.Context()
             self._socket = self._context.socket(zmq.ROUTER)
             self._receiver = _BoundedMultipartReceiver(self._socket)
             _configure_socket(self._socket, high_water_mark, max_message_bytes)
@@ -193,22 +252,18 @@ class ZmqServiceServer:
             self._socket.bind(endpoint)
             actual_endpoint = self._socket.getsockopt(zmq.LAST_ENDPOINT)
             self.endpoint = actual_endpoint.decode("utf-8", errors="strict")
-        except Exception:
-            if self._authenticator is not None:
-                with suppress(Exception):
-                    self._authenticator.stop()
-            if self._socket is not None:
-                with suppress(Exception):
-                    self._socket.close(linger=0)
-            with suppress(Exception):
-                self._context.term()
+        except BaseException:
+            try:
+                self.close()
+            except BaseException:
+                raise ServiceTransportStartupCleanupError(self) from None
             raise
 
     def serve_once(self, timeout_ms: int = 0) -> bool:
         """Handle one received message, returning false when the wait expires."""
 
         self._check_thread()
-        if self._closed:
+        if self._closed or self._close_pending:
             raise RuntimeError("server is closed")
         if type(timeout_ms) is not int or timeout_ms < 0:
             raise ValueError("timeout_ms must be a non-negative integer")
@@ -268,27 +323,29 @@ class ZmqServiceServer:
         return True
 
     def close(self) -> None:
-        """Idempotently close the owned socket, authenticator, and context."""
+        """Close owned resources in order; retry a failed stage on this thread."""
 
         if self._closed:
             return
         self._check_thread()
-        self._closed = True
-        if self._authenticator is not None:
-            authenticator = self._authenticator
+        self._close_pending = True
+        authenticator = self._authenticator
+        if authenticator is not None:
+            authenticator.stop()
             self._authenticator = None
-            try:
-                authenticator.stop()
-            finally:
-                try:
-                    self._socket.close(linger=0)
-                finally:
-                    self._context.term()
+        socket = self._socket
+        if socket is not None:
+            socket.close(linger=0)
+            self._socket = None
+            self._receiver = None
         else:
-            try:
-                self._socket.close(linger=0)
-            finally:
-                self._context.term()
+            self._receiver = None
+        context = self._context
+        if context is not None:
+            context.term()
+            self._context = None
+        self._closed = True
+        self._close_pending = False
 
     def _authenticated_peer(self, frame: zmq.Frame) -> Optional[tuple[str, PublicKey]]:  # noqa: UP045 -- Python 3.9 compatibility.
         try:
@@ -353,9 +410,11 @@ class ZmqServiceClient:
         self._reply_box = SealedBox(reply_private_key)
         self._owner_thread = threading.get_ident()
         self._closed = False
+        self._close_pending = False
         self._inflight = False
         self._last_uncertain_message_id = None
         self._socket_message_ids = set()
+        self._socket_retirement_pending = False
         self._context = zmq.Context()
         self._socket = None
         self._receiver = None
@@ -373,7 +432,7 @@ class ZmqServiceClient:
         """Send one request and return only its correctly bound service reply."""
 
         self._check_thread()
-        if self._closed:
+        if self._closed or self._close_pending:
             raise RuntimeError("client is closed")
         if self._inflight:
             raise RuntimeError("only one request may be in flight")
@@ -466,16 +525,19 @@ class ZmqServiceClient:
             self._inflight = False
 
     def close(self) -> None:
-        """Idempotently close this client's owned socket and private context."""
+        """Close owned resources in order; retry a failed stage on this thread."""
 
         if self._closed:
             return
         self._check_thread()
+        self._close_pending = True
+        self._retire_socket()
+        context = self._context
+        if context is not None:
+            context.term()
+            self._context = None
         self._closed = True
-        try:
-            self._retire_socket()
-        finally:
-            self._context.term()
+        self._close_pending = False
 
     def _open_socket(self) -> None:
         socket = self._context.socket(zmq.DEALER)
@@ -495,15 +557,22 @@ class ZmqServiceClient:
         self._receiver = _BoundedMultipartReceiver(socket)
 
     def _ensure_socket(self) -> None:
+        if self._socket_retirement_pending:
+            self._retire_socket()
         if self._socket is None:
             self._open_socket()
 
     def _retire_socket(self) -> None:
         socket = self._socket
+        if socket is None:
+            self._receiver = None
+            self._socket_retirement_pending = False
+            return
+        self._socket_retirement_pending = True
+        socket.close(linger=0)
         self._socket = None
         self._receiver = None
-        if socket is not None:
-            socket.close(linger=0)
+        self._socket_retirement_pending = False
 
     def _check_thread(self) -> None:
         if threading.get_ident() != self._owner_thread:
@@ -551,7 +620,7 @@ def _copy_principals(principals: Mapping[bytes, str]) -> Mapping[bytes, str]:
             raise ValueError("principal map keys must be 40-byte Z85 public keys")
         try:
             z85.decode(public_key)
-        except (ValueError, UnicodeDecodeError) as exc:
+        except (KeyError, ValueError, UnicodeDecodeError) as exc:
             raise ValueError("principal map key is not valid Z85") from exc
         _validate_principal_ref(principal_ref)
         copied[public_key] = principal_ref
