@@ -415,17 +415,17 @@ class ZmqServiceClient:
         self._last_uncertain_message_id = None
         self._socket_message_ids = set()
         self._socket_retirement_pending = False
-        self._context = zmq.Context()
+        self._context = None
         self._socket = None
         self._receiver = None
         try:
+            self._context = zmq.Context()
             self._open_socket()
-        except Exception:
-            if self._socket is not None:
-                with suppress(Exception):
-                    self._socket.close(linger=0)
-            with suppress(Exception):
-                self._context.term()
+        except BaseException:
+            try:
+                self.close()
+            except BaseException:
+                raise ServiceTransportStartupCleanupError(self) from None
             raise
 
     def request(self, request: WireEnvelope, *, timeout: float) -> WireEnvelope:
@@ -540,25 +540,26 @@ class ZmqServiceClient:
         self._close_pending = False
 
     def _open_socket(self) -> None:
-        socket = self._context.socket(zmq.DEALER)
-        try:
-            _configure_socket(socket, self._high_water_mark, self._max_message_bytes)
-            socket.setsockopt(zmq.IMMEDIATE, 1)
-            socket.setsockopt(zmq.IDENTITY, ("bt-api-v2-" + uuid.uuid4().hex).encode("ascii"))
-            socket.curve_serverkey = self._server_key
-            socket.curve_publickey = self._public_key
-            socket.curve_secretkey = self._secret_key
-            socket.connect(self._endpoint)
-        except Exception:
-            with suppress(Exception):
-                socket.close(linger=0)
-            raise
+        context = self._context
+        if context is None:
+            raise ServiceTransportError("client context is unavailable")
+        socket = context.socket(zmq.DEALER)
         self._socket = socket
+        self._receiver = None
+        self._socket_retirement_pending = True
+        _configure_socket(socket, self._high_water_mark, self._max_message_bytes)
+        socket.setsockopt(zmq.IMMEDIATE, 1)
+        socket.setsockopt(zmq.IDENTITY, ("bt-api-v2-" + uuid.uuid4().hex).encode("ascii"))
+        socket.curve_serverkey = self._server_key
+        socket.curve_publickey = self._public_key
+        socket.curve_secretkey = self._secret_key
+        socket.connect(self._endpoint)
         self._receiver = _BoundedMultipartReceiver(socket)
+        self._socket_retirement_pending = False
 
     def _ensure_socket(self) -> None:
         if self._socket_retirement_pending:
-            self._retire_socket()
+            raise ServiceTransportError("client socket cleanup is pending; call close() to retry")
         if self._socket is None:
             self._open_socket()
 

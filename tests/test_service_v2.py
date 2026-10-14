@@ -1328,6 +1328,132 @@ def test_client_close_retries_failed_socket_then_context() -> None:
                 client.close()
 
 
+def test_client_startup_cleanup_hands_off_partial_resources_and_preserves_interrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server_public, _server_secret = zmq.curve_keypair()
+    _client_public, credentials = _client_credentials(server_public)
+    identity = _identity(WireRole.SERVICE, "service-a", "gateway-a")
+
+    def install_fakes(
+        startup_error: type[BaseException],
+        *,
+        socket_close_failures: int = 0,
+        context_failures: int = 0,
+    ) -> dict[str, Any]:
+        state: dict[str, Any] = {
+            "events": [],
+            "socket_close_failures": socket_close_failures,
+            "context_failures": context_failures,
+        }
+
+        class FakeSocket:
+            def __init__(self) -> None:
+                self.close_calls = 0
+                self.closed = False
+
+            def setsockopt(self, *_args: Any) -> None:
+                return None
+
+            def connect(self, _endpoint: str) -> None:
+                state["events"].append("socket.connect")
+                raise startup_error("injected connect failure")
+
+            def close(self, *, linger: int) -> None:
+                assert linger == 0
+                self.close_calls += 1
+                state["events"].append("socket.close")
+                if state["socket_close_failures"]:
+                    state["socket_close_failures"] -= 1
+                    raise RuntimeError("injected client socket close failure")
+                self.closed = True
+
+        class FakeContext:
+            def __init__(self) -> None:
+                self.socket_object = FakeSocket()
+                self.term_calls = 0
+                self.terminated = False
+
+            def socket(self, _socket_type: int) -> FakeSocket:
+                state["events"].append("context.socket")
+                return self.socket_object
+
+            def term(self) -> None:
+                self.term_calls += 1
+                state["events"].append("context.term")
+                if state["context_failures"]:
+                    state["context_failures"] -= 1
+                    raise RuntimeError("injected client context term failure")
+                self.terminated = True
+
+        def make_context() -> FakeContext:
+            state["events"].append("context.create")
+            context = FakeContext()
+            state.update(context=context, socket=context.socket_object)
+            return context
+
+        monkeypatch.setattr(service_v2.zmq, "Context", make_context)
+        return state
+
+    partial = install_fakes(RuntimeError, socket_close_failures=1, context_failures=1)
+    with pytest.raises(ServiceTransportStartupCleanupError) as caught:
+        ZmqServiceClient(
+            "tcp://127.0.0.1:1",
+            identity,
+            credentials=credentials,
+        )
+    client = caught.value.transport
+    assert isinstance(client, ZmqServiceClient)
+    assert caught.value.cause_code == "startup_cleanup_failed"
+    assert client._closed is False
+    assert client._close_pending is True
+    assert client._socket is partial["socket"]
+    assert client._receiver is None
+    assert client._context is partial["context"]
+    assert client._socket_retirement_pending is True
+    assert partial["socket"].close_calls == 1
+    assert partial["context"].term_calls == 0
+    assert partial["socket"].closed is False
+    with pytest.raises(RuntimeError, match="client is closed"):
+        client.request(_request("during-startup-cleanup"), timeout=0.1)
+
+    with pytest.raises(RuntimeError, match="context term failure"):
+        client.close()
+    assert client._closed is False
+    assert client._socket is None
+    assert client._receiver is None
+    assert client._context is partial["context"]
+    assert client._socket_retirement_pending is False
+    assert partial["socket"].close_calls == 2
+    assert partial["socket"].closed is True
+    assert partial["context"].term_calls == 1
+    assert partial["context"].terminated is False
+
+    client.close()
+    assert client._closed is True
+    assert client._close_pending is False
+    assert client._socket is None
+    assert client._context is None
+    assert partial["socket"].close_calls == 2
+    assert partial["context"].term_calls == 2
+    assert partial["context"].terminated is True
+    assert partial["events"][-2:] == ["context.term", "context.term"]
+
+    for startup_error in (RuntimeError, KeyboardInterrupt):
+        normal = install_fakes(startup_error)
+        with pytest.raises(startup_error, match="injected connect failure"):
+            ZmqServiceClient(
+                "tcp://127.0.0.1:1",
+                identity,
+                credentials=credentials,
+            )
+        assert normal["socket"].close_calls == 1
+        assert normal["socket"].closed is True
+        assert normal["context"].term_calls == 1
+        assert normal["context"].terminated is True
+        assert normal["events"][-3:] == ["socket.connect", "socket.close", "context.term"]
+
+
 def test_client_enforces_thread_affinity_and_close_is_idempotent() -> None:
     server_public, _server_secret = zmq.curve_keypair()
     _client_public, credentials = _client_credentials(server_public)
