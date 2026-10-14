@@ -27,6 +27,7 @@ from bt_api_base.service_protocol import (
     MAX_WIRE_MESSAGE_BYTES,
     WIRE_PROTOCOL_VERSION,
     WireEnvelope,
+    WireErrorCode,
     WireHeader,
     WireIdentity,
     WireMessageKind,
@@ -683,6 +684,37 @@ def _make_reply(
         owner_epoch=request_header.owner_epoch,
     )
     return WireEnvelope(header=header, payload=payload)
+
+
+def service_reply_fits(
+    identity: WireIdentity,
+    request: WireEnvelope,
+    payload: Mapping[str, Any],
+    *,
+    max_message_bytes: int,
+) -> bool:
+    """Return whether a normal SDK reply fits the configured sealed-frame budget.
+
+    The payload must be the complete ``ok``/``code``/``result`` wrapper accepted
+    from a service handler. This performs the same envelope encoding and budget
+    calculation as the server without creating or using transport resources.
+    """
+
+    _validate_limits(DEFAULT_HIGH_WATER_MARK, max_message_bytes)
+    if type(identity) is not WireIdentity or identity.role is not WireRole.SERVICE:
+        raise ValueError("service identity must have the service role")
+    if type(request) is not WireEnvelope:
+        raise ValueError("request must be a WireEnvelope")
+    validate_request(request)
+
+    reply = _make_reply(identity, request, _handler_payload(payload))
+    try:
+        encode_envelope(reply, max_bytes=max_message_bytes - _REPLY_FRAME_OVERHEAD)
+    except WireValidationError as exc:
+        if exc.code is WireErrorCode.MESSAGE_TOO_LARGE:
+            return False
+        raise
+    return True
 
 
 def _seal_reply(encoded_reply: bytes, recipient_key: PublicKey) -> bytes:
