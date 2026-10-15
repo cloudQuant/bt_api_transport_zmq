@@ -21,3 +21,24 @@ grant. Unencrypted local loopback, IPC, and inproc endpoints remain available
 for offline/integration use with an injected authenticator. Messages reject
 secret-shaped keys and non-finite JSON values before they enter a queue or
 durable journal.
+
+## Market PUB/SUB wire versions
+
+The market transport keeps wire version 1 as the default: the publisher sends
+one encoded envelope frame and each authorized subscriber receives every
+market key on that audience endpoint. Wire version 2 is an explicit opt-in for
+one-key subscribers. The publisher sends two frames: a binary topic containing
+the complete `MarketSubscriptionKey.stream_id`, followed by the unchanged
+encoded envelope. The subscriber installs a ZeroMQ prefix filter for that full
+topic, then verifies the exact topic, envelope, stream ID, payload key, peer,
+and scope.
+
+Both ends must agree on the wire version through the trusted deployment or
+market-subscription capability contract before opening the stream. Mixed
+versions do not fall back: a v1 subscriber drops v2 multipart messages, and a
+v2 subscriber does not match v1 envelope frames. The SDK/control plane must
+reject a mismatch rather than report an empty stream as a successful
+subscription. Topic filtering reduces delivery work; it is not authorization.
+CURVE authentication and the publisher's finite principal ACL remain required
+for both versions. High-water marks and envelope size limits apply in either
+version.

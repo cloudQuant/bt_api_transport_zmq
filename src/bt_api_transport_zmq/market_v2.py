@@ -1,10 +1,12 @@
 """CURVE-authenticated PUB/SUB transport for neutral v2 market events.
 
-The publisher's principal map is a server-owned audience ACL: every connected
-CURVE key in that map can receive every event on this socket.  This module does
-not filter by market key, replay history, or acknowledge delivery.  Construct,
-use, and close each transport on one thread; each instance owns its context,
-socket, and (for publishers) authenticator.
+The publisher's principal map is a server-owned audience ACL: listed CURVE
+keys are authorized to connect and receive traffic. Version 1 sends every
+single-frame event to that audience; version 2 adds per-topic delivery
+filtering, but the topic is not an authorization decision. This module does
+not replay history or acknowledge delivery. Construct, use, and close each
+transport on one thread; each instance owns its context, socket, and (for
+publishers) authenticator.
 """
 
 from __future__ import annotations
@@ -47,6 +49,13 @@ MAX_PRINCIPALS = 4096
 MAX_DRAIN_FRAMES_PER_CALL = 64
 _MAX_SOCKET_OPTION_INT = 2_147_483_647
 _ZAP_DOMAIN = "bt-api-market-v2"
+MARKET_WIRE_VERSION_LEGACY = 1
+MARKET_WIRE_VERSION_TOPIC_FILTERED = 2
+_SUPPORTED_MARKET_WIRE_VERSIONS = frozenset(
+    {MARKET_WIRE_VERSION_LEGACY, MARKET_WIRE_VERSION_TOPIC_FILTERED}
+)
+_TOPIC_FILTERED_FRAME_PREFIX = b"\x00BTAPI-MARKET\x00\x02"
+_MAX_TOPIC_FRAME_BYTES = len(_TOPIC_FILTERED_FRAME_PREFIX) + len("market-") + 64 + 1
 
 
 class _MarketPrincipalRegistry:
@@ -92,6 +101,48 @@ class _BoundedMultipartReceiver:
                 return
 
 
+class _BoundedTopicReceiver:
+    """Read exactly two bounded topic/envelope frames and drain extras safely."""
+
+    def __init__(self, socket: zmq.Socket) -> None:
+        self._socket = socket
+        self._discarding = False
+
+    def receive(self) -> tuple[zmq.Frame, zmq.Frame] | None:
+        if self._discarding:
+            self._drain()
+            return None
+
+        try:
+            topic = self._socket.recv(flags=zmq.NOBLOCK, copy=False)
+        except zmq.Again:
+            return None
+        if not self._socket.getsockopt(zmq.RCVMORE):
+            return None
+
+        try:
+            envelope = self._socket.recv(flags=zmq.NOBLOCK, copy=False)
+        except zmq.Again:
+            self._discarding = True
+            self._drain()
+            return None
+        if self._socket.getsockopt(zmq.RCVMORE):
+            self._discarding = True
+            self._drain()
+            return None
+        return topic, envelope
+
+    def _drain(self) -> None:
+        for _ in range(MAX_DRAIN_FRAMES_PER_CALL):
+            try:
+                self._socket.recv(flags=zmq.NOBLOCK, copy=False)
+            except zmq.Again:
+                return
+            if not self._socket.getsockopt(zmq.RCVMORE):
+                self._discarding = False
+                return
+
+
 class MarketTransportError(RuntimeError):
     """The authenticated market event transport could not safely operate."""
 
@@ -105,6 +156,7 @@ def validate_publisher_configuration(
     credentials: CurveServerCredentials,
     high_water_mark: int = DEFAULT_HIGH_WATER_MARK,
     max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES,
+    wire_version: int = MARKET_WIRE_VERSION_LEGACY,
 ) -> None:
     """Validate publisher inputs without creating ZMQ resources."""
 
@@ -116,6 +168,7 @@ def validate_publisher_configuration(
         credentials=credentials,
         high_water_mark=high_water_mark,
         max_message_bytes=max_message_bytes,
+        wire_version=wire_version,
     )
 
 
@@ -128,6 +181,7 @@ def _validated_publisher_configuration(
     credentials: CurveServerCredentials,
     high_water_mark: int,
     max_message_bytes: int,
+    wire_version: int,
 ) -> Mapping[bytes, str]:
     _validate_endpoint(endpoint)
     if type(identity) is not WireIdentity or identity.role is not WireRole.SERVICE:
@@ -136,6 +190,7 @@ def _validated_publisher_configuration(
         raise ValueError("market publisher scope must be a WireScope")
     _validate_public_market_scope(scope)
     _validate_limits(high_water_mark, max_message_bytes)
+    _validate_market_wire_version(wire_version)
     copied_principals = _copy_principals(principals)
     if not copied_principals:
         raise ValueError("market publisher audience must not be empty")
@@ -149,11 +204,15 @@ class ZmqMarketPublisher:
     """CURVE-authenticated PUB socket for one identity and scope.
 
     ``principals`` maps each authorized client's Z85 CURVE public key to a
-    finite trusted reference. All authorized peers receive all market keys;
-    downstream SDK code performs any key or sequence filtering. ``publish``
-    follows the neutral publisher port and returns no delivery status. The
-    optional ``try_publish`` reports local send acceptance only; PUB may still
-    discard for a slow subscriber.
+    finite trusted reference. Legacy wire version 1 broadcasts each
+    single-frame envelope to authorized peers. Version 2 sends a topic frame
+    derived from the complete event stream ID before the unchanged envelope,
+    allowing matching subscribers to filter in ZeroMQ. This topic is not an
+    authorization decision; the CURVE audience remains authoritative. Both
+    peers must be configured for the same transport version by the trusted
+    control/deployment layer. ``publish`` follows the neutral publisher port
+    and returns no delivery status. The optional ``try_publish`` reports local
+    send acceptance only; PUB may still discard for a slow subscriber.
     """
 
     def __init__(
@@ -166,6 +225,7 @@ class ZmqMarketPublisher:
         credentials: CurveServerCredentials,
         high_water_mark: int = DEFAULT_HIGH_WATER_MARK,
         max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES,
+        wire_version: int = MARKET_WIRE_VERSION_LEGACY,
     ) -> None:
         copied_principals = _validated_publisher_configuration(
             endpoint,
@@ -175,6 +235,7 @@ class ZmqMarketPublisher:
             credentials=credentials,
             high_water_mark=high_water_mark,
             max_message_bytes=max_message_bytes,
+            wire_version=wire_version,
         )
         self._identity = identity
         self._scope = scope
@@ -182,6 +243,7 @@ class ZmqMarketPublisher:
         self._credentials = credentials
         self._high_water_mark = high_water_mark
         self._max_message_bytes = max_message_bytes
+        self._wire_version = wire_version
         self._owner_thread = threading.get_ident()
         self._closed = False
         self._close_pending = False
@@ -228,7 +290,12 @@ class ZmqMarketPublisher:
         _validate_market_event(event, self._identity, self._scope)
         encoded = encode_envelope(event, max_bytes=self._max_message_bytes)
         try:
-            self._socket.send(encoded, flags=zmq.NOBLOCK)
+            if self._wire_version == MARKET_WIRE_VERSION_LEGACY:
+                self._socket.send(encoded, flags=zmq.NOBLOCK)
+            else:
+                key = MarketSubscriptionKey.from_dict(event.payload["key"])
+                topic = _market_topic_for_stream_id(key.stream_id)
+                self._socket.send_multipart([topic, encoded], flags=zmq.NOBLOCK)
         except zmq.Again:
             return False
         return True
@@ -263,9 +330,14 @@ class ZmqMarketPublisher:
 class ZmqMarketSubscriber:
     """CURVE-authenticated SUB socket for one expected service and scope.
 
-    Sequence cursors and key filtering belong to the SDK. This socket provides
-    no replay or baseline recovery; a timeout or dropped malformed frame both
-    return ``None`` and do not establish whether a sequence gap occurred.
+    Wire version 1 receives all market keys for the configured audience and
+    leaves key filtering to the SDK. Wire version 2 requires one exact
+    ``MarketSubscriptionKey`` and subscribes with its full topic as a ZeroMQ
+    prefix filter, then checks exact topic equality before decoding. The event
+    envelope and that key are also checked after receipt. Sequence
+    cursors and replay remain SDK responsibilities. This socket provides no
+    baseline recovery; a timeout or dropped malformed frame both return
+    ``None`` and do not establish whether a sequence gap occurred.
     """
 
     def __init__(
@@ -277,6 +349,8 @@ class ZmqMarketSubscriber:
         credentials: CurveClientCredentials,
         high_water_mark: int = DEFAULT_HIGH_WATER_MARK,
         max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES,
+        wire_version: int = MARKET_WIRE_VERSION_LEGACY,
+        subscription_key: MarketSubscriptionKey | None = None,
     ) -> None:
         _validate_subscriber_configuration(
             endpoint,
@@ -285,6 +359,8 @@ class ZmqMarketSubscriber:
             credentials=credentials,
             high_water_mark=high_water_mark,
             max_message_bytes=max_message_bytes,
+            wire_version=wire_version,
+            subscription_key=subscription_key,
         )
         self._endpoint = endpoint
         self.endpoint = endpoint
@@ -292,6 +368,13 @@ class ZmqMarketSubscriber:
         self._expected_scope = expected_scope
         self._high_water_mark = high_water_mark
         self._max_message_bytes = max_message_bytes
+        self._wire_version = wire_version
+        self._subscription_key = subscription_key
+        self._topic = (
+            _market_topic_for_stream_id(subscription_key.stream_id)
+            if wire_version == MARKET_WIRE_VERSION_TOPIC_FILTERED
+            else None
+        )
         self._credentials = credentials
         self._owner_thread = threading.get_ident()
         self._closed = False
@@ -302,14 +385,24 @@ class ZmqMarketSubscriber:
         try:
             self._context = zmq.Context()
             self._socket = self._context.socket(zmq.SUB)
-            self._receiver = _BoundedMultipartReceiver(self._socket)
-            _configure_subscriber_socket(self._socket, high_water_mark, max_message_bytes)
+            if wire_version == MARKET_WIRE_VERSION_LEGACY:
+                self._receiver = _BoundedMultipartReceiver(self._socket)
+                subscription = b""
+            else:
+                self._receiver = _BoundedTopicReceiver(self._socket)
+                assert self._topic is not None
+                subscription = self._topic
+            socket_max_message_bytes = max_message_bytes
+            if wire_version == MARKET_WIRE_VERSION_TOPIC_FILTERED:
+                # The application limit covers the unchanged envelope. ZMQ's
+                # inbound limit covers the full multipart message, including
+                # its bounded topic frame.
+                socket_max_message_bytes += _MAX_TOPIC_FRAME_BYTES
+            _configure_subscriber_socket(self._socket, high_water_mark, socket_max_message_bytes)
             self._socket.curve_serverkey = credentials.server_key
             self._socket.curve_publickey = credentials.public_key
             self._socket.curve_secretkey = credentials.secret_key
-            # Transport deliberately subscribes to all events; key-level access
-            # and sequence filtering belong to the trusted SDK/gateway layer.
-            self._socket.setsockopt(zmq.SUBSCRIBE, b"")
+            self._socket.setsockopt(zmq.SUBSCRIBE, subscription)
             self._socket.connect(endpoint)
         except BaseException:
             try:
@@ -356,12 +449,27 @@ class ZmqMarketSubscriber:
 
         if self._socket.poll(poll_timeout_ms, zmq.POLLIN) == 0:
             return None
-        frame = self._receiver.receive()
+        if self._wire_version == MARKET_WIRE_VERSION_LEGACY:
+            frame = self._receiver.receive()
+        else:
+            parts = self._receiver.receive()
+            if parts is None:
+                return None
+            topic, frame = parts
+            if len(topic) > _MAX_TOPIC_FRAME_BYTES or bytes(topic) != self._topic:
+                return None
         if frame is None or len(frame) > self._max_message_bytes:
             return None
         try:
             event = decode_envelope(bytes(frame), max_bytes=self._max_message_bytes)
             _validate_market_event(event, self._expected_peer, self._expected_scope)
+            if self._subscription_key is not None:
+                actual_key = MarketSubscriptionKey.from_dict(event.payload["key"])
+                if (
+                    event.header.stream_id != self._subscription_key.stream_id
+                    or actual_key != self._subscription_key
+                ):
+                    return None
         except ValueError:
             return None
         return event
@@ -429,6 +537,8 @@ def _validate_subscriber_configuration(
     credentials: CurveClientCredentials,
     high_water_mark: int,
     max_message_bytes: int,
+    wire_version: int,
+    subscription_key: MarketSubscriptionKey | None,
 ) -> None:
     _validate_endpoint(endpoint)
     if type(expected_peer) is not WireIdentity or expected_peer.role is not WireRole.SERVICE:
@@ -436,6 +546,13 @@ def _validate_subscriber_configuration(
     if type(expected_scope) is not WireScope:
         raise ValueError("expected market scope must be a WireScope")
     _validate_public_market_scope(expected_scope)
+    _validate_market_wire_version(wire_version)
+    if wire_version == MARKET_WIRE_VERSION_TOPIC_FILTERED:
+        if type(subscription_key) is not MarketSubscriptionKey:
+            raise ValueError("topic-filtered market transport requires a subscription key")
+        _market_topic_for_stream_id(subscription_key.stream_id)
+    elif subscription_key is not None:
+        raise ValueError("legacy market transport does not accept a subscription key")
     if not isinstance(credentials, CurveClientCredentials):
         raise ValueError("Curve client credentials are required")
     _validate_limits(high_water_mark, max_message_bytes)
@@ -484,6 +601,22 @@ def _validate_limits(high_water_mark: int, max_message_bytes: int) -> None:
         or max_message_bytes > MAX_WIRE_MESSAGE_BYTES
     ):
         raise ValueError("max_message_bytes is outside the protocol limit")
+
+
+def _validate_market_wire_version(version: int) -> None:
+    if type(version) is not int or version not in _SUPPORTED_MARKET_WIRE_VERSIONS:
+        raise ValueError("unsupported market wire version")
+
+
+def _market_topic_for_stream_id(stream_id: str) -> bytes:
+    if (
+        type(stream_id) is not str
+        or len(stream_id) != len("market-") + 64
+        or not stream_id.startswith("market-")
+        or any(character not in "0123456789abcdef" for character in stream_id[len("market-") :])
+    ):
+        raise ValueError("market topic requires a canonical subscription stream ID")
+    return _TOPIC_FILTERED_FRAME_PREFIX + stream_id.encode("ascii") + b"\x00"
 
 
 def _copy_principals(principals: Mapping[bytes, str]) -> Mapping[bytes, str]:

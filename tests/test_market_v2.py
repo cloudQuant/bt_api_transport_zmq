@@ -412,6 +412,9 @@ def _fake_subscriber(socket_object: _FakeMultipartSocket, *, max_message_bytes: 
     subscriber._expected_scope = _scope()
     subscriber._high_water_mark = 10
     subscriber._max_message_bytes = max_message_bytes
+    subscriber._wire_version = market_v2.MARKET_WIRE_VERSION_LEGACY
+    subscriber._subscription_key = None
+    subscriber._topic = None
     subscriber._credentials = None
     subscriber._owner_thread = threading.get_ident()
     subscriber._closed = False
