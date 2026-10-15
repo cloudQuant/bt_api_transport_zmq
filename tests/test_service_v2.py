@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import importlib.util
+import json
 import queue
 import socket
+import sys
 import threading
 import time
 from contextlib import suppress
+from pathlib import Path
 from typing import Any, Optional
 
 import pytest
@@ -445,6 +449,84 @@ def test_malformed_and_unsupported_version_messages_are_dropped() -> None:
         context.term()
     _join_server(server)
     assert calls == []
+
+
+def test_legacy_forwarding_order_command_is_dropped_by_live_v2_curve_server() -> None:
+    schema_path = (
+        Path(__file__).resolve().parents[3]
+        / "bt_api_py"
+        / "forwarding"
+        / "schema.py"
+    )
+    module_name = "_iteration10_mig02_legacy_forwarding_schema"
+    spec = importlib.util.spec_from_file_location(module_name, schema_path)
+    assert spec is not None and spec.loader is not None
+    legacy_schema = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = legacy_schema
+    try:
+        spec.loader.exec_module(legacy_schema)
+        old_command = legacy_schema.OrderCommand(
+            strategy_id="strategy-mig02",
+            account_id="account-mig02",
+            symbol="BTC-USDT",
+            side="buy",
+            size="1",
+            command_type="place_order",
+            order_type="market",
+            idempotency_key="mig02-legacy-command",
+        )
+        legacy_frame = legacy_schema.serialize_message(old_command)
+    finally:
+        sys.modules.pop(module_name, None)
+
+    legacy_payload = json.loads(legacy_frame.decode("utf-8"))
+    assert legacy_payload["_message_type"] == "order_command"
+    assert legacy_payload["schema_version"] == "1.0"
+    assert "header" not in legacy_payload
+    assert "payload" not in legacy_payload
+
+    server_public, server_secret = zmq.curve_keypair()
+    client_public, credentials = _client_credentials(server_public)
+    handled: list[tuple[str, WireEnvelope]] = []
+    server = _server_thread(
+        server_credentials=CurveServerCredentials(server_public, server_secret),
+        principals={client_public: "trusted-principal"},
+        handler=lambda principal, request: (
+            handled.append((principal, request))
+            or {"ok": True, "code": "OK", "result": {"ready": True}}
+        ),
+        serve_timeouts=(2000, 2000),
+    )
+    context, client = _raw_curve_client(
+        server["endpoint"], credentials, identity=b"mig02-raw-curve-client"
+    )
+    try:
+        # A successful v2 exchange proves the authenticated route is live before
+        # the legacy flat OrderCommand is tested.
+        _send_raw(client, encode_envelope(_request("mig02-v2-readiness")))
+        assert client.poll(2000, zmq.POLLIN), "live v2 readiness reply was not received"
+        readiness_reply = _decode_sealed_reply(client.recv(), credentials)
+        _wait_step(server, 0)
+        assert dict(readiness_reply.payload) == {
+            "ok": True,
+            "code": "OK",
+            "result": {"ready": True},
+        }
+        assert len(handled) == 1
+        baseline_handler_calls = len(handled)
+
+        _send_raw(client, legacy_frame)
+        _wait_step(server, 1)
+        assert not client.poll(150, zmq.POLLIN), "legacy command received a business reply"
+        assert len(handled) == baseline_handler_calls
+    finally:
+        client.close(linger=0)
+        context.term()
+        _join_server(server)
+
+    assert len(handled) == 1
+    assert handled[0][0] == "trusted-principal"
+    assert handled[0][1].header.message_id == "mig02-v2-readiness"
 
 
 def test_server_boundedly_drains_excess_multipart_frames_then_handles_next_request() -> None:
