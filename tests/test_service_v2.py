@@ -72,7 +72,9 @@ def _server_thread(
     serve_timeouts: tuple[int, ...],
     endpoint: str = "tcp://127.0.0.1:*",
     identity: Optional[WireIdentity] = None,  # noqa: UP045 -- Python 3.9 compatibility.
+    high_water_mark: int = service_v2.DEFAULT_HIGH_WATER_MARK,
     max_message_bytes: int = 1024 * 1024,
+    observe_socket_options: bool = False,
 ) -> dict[str, Any]:
     state: dict[str, Any] = {
         "ready": threading.Event(),
@@ -90,10 +92,16 @@ def _server_thread(
                 principals,
                 handler,
                 credentials=server_credentials,
+                high_water_mark=high_water_mark,
                 max_message_bytes=max_message_bytes,
             )
             state["server"] = server
             state["endpoint"] = server.endpoint
+            if observe_socket_options:
+                state["socket_options"] = {
+                    "sndhwm": server._socket.getsockopt(zmq.SNDHWM),
+                    "rcvhwm": server._socket.getsockopt(zmq.RCVHWM),
+                }
             state["ready"].set()
             for index, timeout_ms in enumerate(serve_timeouts):
                 state["progress"].put((index, server.serve_once(timeout_ms)))
@@ -840,6 +848,100 @@ def test_timeout_is_uncertain_and_late_unrelated_reply_is_ignored() -> None:
     assert second_reply.header.correlation_id == "fast-second"
     assert dict(second_reply.payload["result"]) == {"id": "fast-second"}
     assert handled_ids == ["slow-first", "fast-second"]
+
+
+def test_curve_service_applies_configured_hwm_to_live_sockets() -> None:
+    server_public, server_secret = zmq.curve_keypair()
+    client_public, credentials = _client_credentials(server_public)
+    handled_ids = []
+    server = _server_thread(
+        server_credentials=CurveServerCredentials(server_public, server_secret),
+        principals={client_public: "trusted-principal"},
+        handler=lambda _principal, request: (
+            handled_ids.append(request.header.message_id)
+            or {"ok": True, "code": "OK", "result": {"handled": True}}
+        ),
+        serve_timeouts=(2000,),
+        high_water_mark=3,
+        observe_socket_options=True,
+    )
+    client = None
+    try:
+        client = ZmqServiceClient(
+            server["endpoint"],
+            _identity(WireRole.SERVICE, "service-a", "gateway-a"),
+            credentials=credentials,
+            high_water_mark=5,
+        )
+        assert client._socket.getsockopt(zmq.SNDHWM) == 5
+        assert client._socket.getsockopt(zmq.RCVHWM) == 5
+        assert server["socket_options"] == {"sndhwm": 3, "rcvhwm": 3}
+
+        reply = client.request(_request("configured-hwm"), timeout=2.0)
+    finally:
+        if client is not None:
+            client.close()
+
+    _wait_step(server, 0)
+    _join_server(server)
+    assert handled_ids == ["configured-hwm"]
+    assert reply.header.correlation_id == "configured-hwm"
+    assert dict(reply.payload) == {"ok": True, "code": "OK", "result": {"handled": True}}
+
+
+def test_client_rejects_concurrent_request_while_owner_request_is_in_flight() -> None:
+    server_public, server_secret = zmq.curve_keypair()
+    client_public, credentials = _client_credentials(server_public)
+    client_holder: dict[str, ZmqServiceClient] = {}
+    concurrent_results: queue.Queue[Any] = queue.Queue()
+    contender_threads: list[threading.Thread] = []
+    handled_ids = []
+
+    def handler(_principal: str, request: WireEnvelope) -> dict[str, Any]:
+        handled_ids.append(request.header.message_id)
+
+        def submit_competing_request() -> None:
+            try:
+                client_holder["client"].request(_request("parallel-request"), timeout=0.1)
+            except BaseException as exc:
+                concurrent_results.put(exc)
+            else:
+                concurrent_results.put("unexpected concurrent response")
+
+        contender = threading.Thread(target=submit_competing_request)
+        contender_threads.append(contender)
+        contender.start()
+        contender.join(timeout=2)
+        return {"ok": True, "code": "OK", "result": {"handled": True}}
+
+    server = _server_thread(
+        server_credentials=CurveServerCredentials(server_public, server_secret),
+        principals={client_public: "trusted-principal"},
+        handler=handler,
+        serve_timeouts=(2000,),
+    )
+    client = ZmqServiceClient(
+        server["endpoint"],
+        _identity(WireRole.SERVICE, "service-a", "gateway-a"),
+        credentials=credentials,
+    )
+    client_holder["client"] = client
+    try:
+        reply = client.request(_request("owner-request"), timeout=2.0)
+    finally:
+        client.close()
+
+    _wait_step(server, 0)
+    _join_server(server)
+    for contender in contender_threads:
+        contender.join(timeout=1)
+        assert not contender.is_alive(), "concurrent request thread did not stop"
+    concurrent_result = concurrent_results.get(timeout=1)
+    assert isinstance(concurrent_result, RuntimeError)
+    assert "owning thread" in str(concurrent_result)
+    assert handled_ids == ["owner-request"]
+    assert reply.header.correlation_id == "owner-request"
+    assert dict(reply.payload) == {"ok": True, "code": "OK", "result": {"handled": True}}
 
 
 def test_reply_must_match_configured_service_identity() -> None:
