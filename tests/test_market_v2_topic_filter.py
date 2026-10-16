@@ -7,6 +7,7 @@ import time
 import uuid
 from collections import deque
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -33,11 +34,13 @@ from bt_api_transport_zmq import market_v2
 from bt_api_transport_zmq.market_v2 import (
     MARKET_WIRE_VERSION_LEGACY,
     MARKET_WIRE_VERSION_TOPIC_FILTERED,
+    ZmqMarketContextPool,
     ZmqMarketPublisher,
     ZmqMarketSubscriber,
     validate_publisher_configuration,
 )
 from bt_api_transport_zmq.server import CurveClientCredentials, CurveServerCredentials
+from bt_api_transport_zmq.service_v2 import ServiceTransportStartupCleanupError
 
 _IDENTITY = WireIdentity(
     role=WireRole.SERVICE,
@@ -124,6 +127,7 @@ def _subscriber(
     wire_version: int = MARKET_WIRE_VERSION_LEGACY,
     high_water_mark: int = 1000,
     max_message_bytes: int = 1024 * 1024,
+    context_pool: ZmqMarketContextPool | None = None,
 ) -> ZmqMarketSubscriber:
     return ZmqMarketSubscriber(
         endpoint,
@@ -134,6 +138,7 @@ def _subscriber(
         subscription_key=key,
         high_water_mark=high_water_mark,
         max_message_bytes=max_message_bytes,
+        context_pool=context_pool,
     )
 
 
@@ -494,6 +499,7 @@ def _fake_subscriber(
         else None
     )
     subscriber._credentials = None
+    subscriber._owner_pid = market_v2.os.getpid()
     subscriber._owner_thread = threading.get_ident()
     subscriber._closed = False
     subscriber._close_pending = False
@@ -504,6 +510,147 @@ def _fake_subscriber(
     else:
         subscriber._receiver = market_v2._BoundedTopicReceiver(socket)
     return subscriber
+
+
+def test_subscriber_rejects_same_thread_identity_after_fork_before_socket_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server_public, _server_secret = zmq.curve_keypair()
+    client_public, client_credentials = _curve_client(server_public)
+    pool = ZmqMarketContextPool()
+    subscriber = _subscriber(
+        "tcp://127.0.0.1:1",
+        client_credentials,
+        key=_key("PID-GUARD"),
+        wire_version=MARKET_WIRE_VERSION_TOPIC_FILTERED,
+        context_pool=pool,
+    )
+    raw_socket = subscriber._socket
+
+    class SocketProbe:
+        def __init__(self) -> None:
+            self.poll_calls = 0
+            self.close_calls = 0
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(raw_socket, name)
+
+        def poll(self, *args: Any, **kwargs: Any) -> int:
+            self.poll_calls += 1
+            return raw_socket.poll(*args, **kwargs)
+
+        def close(self, *args: Any, **kwargs: Any) -> None:
+            self.close_calls += 1
+            raw_socket.close(*args, **kwargs)
+
+    probe = SocketProbe()
+    subscriber._socket = probe  # type: ignore[assignment]
+    owner_pid = subscriber._owner_pid
+    owner_thread = subscriber._owner_thread
+    try:
+        monkeypatch.setattr(market_v2, "os", SimpleNamespace(getpid=lambda: owner_pid + 1))
+        with pytest.raises(RuntimeError, match="cannot cross a process boundary"):
+            subscriber.receive(timeout=0)
+        with pytest.raises(RuntimeError, match="cannot cross a process boundary"):
+            subscriber.close()
+
+        assert threading.get_ident() == owner_thread
+        assert probe.poll_calls == 0
+        assert probe.close_calls == 0
+        assert subscriber._closed is False
+        assert subscriber._close_pending is False
+        assert subscriber._socket is probe
+        assert pool._active_leases == 1
+    finally:
+        monkeypatch.setattr(market_v2, "os", SimpleNamespace(getpid=lambda: owner_pid))
+        subscriber._socket = raw_socket
+        if not subscriber._closed:
+            subscriber.close()
+    assert subscriber._closed is True
+    assert subscriber._context is None
+    assert pool._active_leases == 0
+
+
+def test_context_pool_rejects_fork_before_acquiring_inherited_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool = ZmqMarketContextPool()
+    lease = pool.acquire()
+    owner_pid = pool._owner_pid
+    original_lock = pool._lock
+
+    class InheritedLockedRLock:
+        def __enter__(self) -> None:
+            raise AssertionError("child blocked on an inherited pool lock")
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+    monkeypatch.setattr(pool, "_lock", InheritedLockedRLock())
+    monkeypatch.setattr(market_v2, "os", SimpleNamespace(getpid=lambda: owner_pid + 1))
+    with pytest.raises(RuntimeError, match="context pool cannot cross a process boundary"):
+        pool.acquire()
+    with pytest.raises(RuntimeError, match="context lease cannot cross a process boundary"):
+        lease.close()
+
+    assert lease._released is False
+    assert pool._active_leases == 1
+
+    monkeypatch.setattr(market_v2, "os", SimpleNamespace(getpid=lambda: owner_pid))
+    monkeypatch.setattr(pool, "_lock", original_lock)
+    lease.close()
+    assert lease._released is True
+    assert pool._active_leases == 0
+    assert pool._context is None
+
+
+def test_pooled_constructor_cleanup_failure_retains_lease_for_close_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server_public, _server_secret = zmq.curve_keypair()
+    _client_public, client_credentials = _curve_client(server_public)
+    pool = ZmqMarketContextPool()
+    original_configure = market_v2._configure_subscriber_socket
+    original_close = zmq.Socket.close
+    close_failed = False
+
+    def fail_configuration(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("injected subscriber configuration failure")
+
+    def fail_first_socket_close(socket: zmq.Socket, *args: Any, **kwargs: Any) -> None:
+        nonlocal close_failed
+        if not close_failed:
+            close_failed = True
+            raise RuntimeError("injected startup socket close failure")
+        original_close(socket, *args, **kwargs)
+
+    monkeypatch.setattr(market_v2, "_configure_subscriber_socket", fail_configuration)
+    monkeypatch.setattr(zmq.Socket, "close", fail_first_socket_close)
+    with pytest.raises(ServiceTransportStartupCleanupError) as captured:
+        _subscriber(
+            "tcp://127.0.0.1:1",
+            client_credentials,
+            key=_key("STARTUP-RETRY"),
+            wire_version=MARKET_WIRE_VERSION_TOPIC_FILTERED,
+            context_pool=pool,
+        )
+
+    retained = captured.value.transport
+    assert isinstance(retained, ZmqMarketSubscriber)
+    assert retained._close_pending is True
+    assert retained._closed is False
+    assert retained._context is pool._context
+    assert retained._socket is not None
+    assert pool._active_leases == 1
+
+    monkeypatch.setattr(zmq.Socket, "close", original_close)
+    retained.close()
+    assert retained._closed is True
+    assert retained._context is None
+    assert pool._context is None
+    assert pool._active_leases == 0
+    assert close_failed is True
+    monkeypatch.setattr(market_v2, "_configure_subscriber_socket", original_configure)
 
 
 def test_mixed_wire_frames_are_dropped_without_automatic_fallback() -> None:
@@ -580,3 +727,109 @@ def test_wire_versions_and_required_key_are_validated_before_io(
         )
     with pytest.raises(ValueError, match="does not accept a subscription key"):
         _subscriber("tcp://127.0.0.1:12345", client_credentials, key=key)
+
+
+def test_shared_context_pool_keeps_topic_sockets_independent_and_close_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server_public, server_secret = zmq.curve_keypair()
+    server_credentials = CurveServerCredentials(server_public, server_secret)
+    client_public, client_credentials = _curve_client(server_public)
+    publisher = _publisher(
+        server_credentials,
+        {client_public: "shared-context-reader"},
+        wire_version=MARKET_WIRE_VERSION_TOPIC_FILTERED,
+    )
+    pool = ZmqMarketContextPool()
+    key_a = _key("BTC-USD-PERP")
+    key_b = _key("ETH-USD-PERP")
+    subscriber_a = _subscriber(
+        publisher.endpoint,
+        client_credentials,
+        key=key_a,
+        wire_version=MARKET_WIRE_VERSION_TOPIC_FILTERED,
+        high_water_mark=17,
+        max_message_bytes=8192,
+        context_pool=pool,
+    )
+    subscriber_b = _subscriber(
+        publisher.endpoint,
+        client_credentials,
+        key=key_b,
+        wire_version=MARKET_WIRE_VERSION_TOPIC_FILTERED,
+        high_water_mark=19,
+        max_message_bytes=16384,
+        context_pool=pool,
+    )
+    shared_context = subscriber_a._context
+    raw_socket_a = subscriber_a._socket
+    assert shared_context is subscriber_b._context
+    assert raw_socket_a is not subscriber_b._socket
+    assert subscriber_a._socket.getsockopt(zmq.RCVHWM) == 17
+    assert subscriber_b._socket.getsockopt(zmq.RCVHWM) == 19
+    assert subscriber_a._socket.getsockopt(zmq.MAXMSGSIZE) == (
+        8192 + market_v2._MAX_TOPIC_FRAME_BYTES
+    )
+    assert subscriber_b._socket.getsockopt(zmq.MAXMSGSIZE) == (
+        16384 + market_v2._MAX_TOPIC_FRAME_BYTES
+    )
+
+    original_term = zmq.Context.term
+    term_calls = 0
+
+    def fail_once_term(context: zmq.Context) -> None:
+        nonlocal term_calls
+        if context is shared_context and term_calls == 0:
+            term_calls += 1
+            raise RuntimeError("injected shared-context termination failure")
+        original_term(context)
+
+    monkeypatch.setattr(zmq.Context, "term", fail_once_term)
+
+    class FailOnceSocket:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def close(self, *, linger: int) -> None:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("injected shared subscriber close failure")
+            raw_socket_a.close(linger=linger)
+
+    try:
+        _wait_for_two_topics(publisher, subscriber_a, key_a, subscriber_b, key_b)
+        subscriber_a._socket = FailOnceSocket()
+        with pytest.raises(RuntimeError, match="injected shared subscriber close failure"):
+            subscriber_a.close()
+        assert subscriber_a._close_pending is True
+        assert subscriber_a._context is shared_context
+        assert shared_context.closed is False
+
+        subscriber_a.close()
+        assert subscriber_a._closed is True
+        assert subscriber_b._context is shared_context
+        assert shared_context.closed is False
+
+        with pytest.raises(RuntimeError, match="injected shared-context termination failure"):
+            subscriber_b.close()
+        assert subscriber_b._close_pending is True
+        assert subscriber_b._context is shared_context
+        assert shared_context.closed is False
+
+        subscriber_b.close()
+        assert subscriber_b._closed is True
+        assert subscriber_b._context is None
+        assert shared_context.closed is True
+    finally:
+        if not subscriber_a._closed:
+            try:
+                subscriber_a.close()
+            except RuntimeError:
+                subscriber_a.close()
+        if not subscriber_b._closed:
+            try:
+                subscriber_b.close()
+            except RuntimeError:
+                subscriber_b.close()
+        if not publisher._closed:
+            publisher.close()

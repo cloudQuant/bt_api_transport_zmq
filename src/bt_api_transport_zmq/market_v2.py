@@ -5,13 +5,15 @@ keys are authorized to connect and receive traffic. Version 1 sends every
 single-frame event to that audience; version 2 adds per-topic delivery
 filtering, but the topic is not an authorization decision. This module does
 not replay history or acknowledge delivery. Construct, use, and close each
-transport on one thread; each instance owns its context, socket, and (for
-publishers) authenticator.
+transport on one thread and process. Subscribers may lease a process-local
+shared context but always own distinct sockets; publishers own their context,
+socket, and authenticator.
 """
 
 from __future__ import annotations
 
 import math
+import os
 import threading
 from collections.abc import Mapping
 from types import MappingProxyType
@@ -56,6 +58,91 @@ _SUPPORTED_MARKET_WIRE_VERSIONS = frozenset(
 )
 _TOPIC_FILTERED_FRAME_PREFIX = b"\x00BTAPI-MARKET\x00\x02"
 _MAX_TOPIC_FRAME_BYTES = len(_TOPIC_FILTERED_FRAME_PREFIX) + len("market-") + 64 + 1
+
+
+class ZmqMarketContextPool:
+    """Share one process-local ZMQ context across owned market subscribers.
+
+    Each subscriber still owns a distinct socket and receiver. The pool only
+    holds the context until the final subscriber has closed its socket; then
+    it terminates the context. A live context cannot cross a process boundary.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._context = None
+        self._owner_pid = os.getpid()
+        self._active_leases = 0
+        self._termination_pending = False
+
+    def acquire(self) -> _ZmqMarketContextLease:
+        current_pid = os.getpid()
+        if current_pid != self._owner_pid:
+            raise RuntimeError("market ZMQ context pool cannot cross a process boundary")
+        with self._lock:
+            # Keep the creator check under the lock as well as before it: the
+            # first check prevents an inherited locked RLock from blocking a
+            # forked child, while this one protects the state transition.
+            current_pid = os.getpid()
+            if current_pid != self._owner_pid:
+                raise RuntimeError("market ZMQ context pool cannot cross a process boundary")
+            if self._context is not None:
+                if self._termination_pending:
+                    raise RuntimeError("market ZMQ context termination is pending")
+            else:
+                self._context = zmq.Context(io_threads=1)
+            self._active_leases += 1
+            return _ZmqMarketContextLease(self, self._context, current_pid)
+
+    def _release(self, lease: _ZmqMarketContextLease) -> None:
+        current_pid = os.getpid()
+        if current_pid != self._owner_pid or current_pid != lease._owner_pid:
+            raise RuntimeError("market ZMQ context lease cannot cross a process boundary")
+        with self._lock:
+            current_pid = os.getpid()
+            if current_pid != self._owner_pid or current_pid != lease._owner_pid:
+                raise RuntimeError("market ZMQ context lease cannot cross a process boundary")
+            if lease._pool is not self:
+                raise RuntimeError("market ZMQ context lease has the wrong owner")
+            if lease._released:
+                if self._termination_pending and self._active_leases == 0:
+                    self._terminate_context_locked(lease._context)
+                return
+            if self._context is not lease._context or self._active_leases <= 0:
+                raise RuntimeError("market ZMQ context lease state is inconsistent")
+            self._active_leases -= 1
+            lease._released = True
+            if self._active_leases == 0:
+                self._terminate_context_locked(lease._context)
+
+    def _terminate_context_locked(self, context: zmq.Context) -> None:
+        try:
+            context.term()
+        except BaseException:
+            self._termination_pending = True
+            raise
+        self._context = None
+        self._termination_pending = False
+
+
+class _ZmqMarketContextLease:
+    def __init__(
+        self,
+        pool: ZmqMarketContextPool,
+        context: zmq.Context,
+        owner_pid: int,
+    ) -> None:
+        self._pool = pool
+        self._context = context
+        self._owner_pid = owner_pid
+        self._released = False
+
+    @property
+    def context(self) -> zmq.Context:
+        return self._context
+
+    def close(self) -> None:
+        self._pool._release(self)
 
 
 class _MarketPrincipalRegistry:
@@ -334,10 +421,10 @@ class ZmqMarketSubscriber:
     leaves key filtering to the SDK. Wire version 2 requires one exact
     ``MarketSubscriptionKey`` and subscribes with its full topic as a ZeroMQ
     prefix filter, then checks exact topic equality before decoding. The event
-    envelope and that key are also checked after receipt. Sequence
-    cursors and replay remain SDK responsibilities. This socket provides no
-    baseline recovery; a timeout or dropped malformed frame both return
-    ``None`` and do not establish whether a sequence gap occurred.
+    envelope and that key are also checked after receipt. Sequence cursors
+    and replay remain SDK responsibilities. This socket provides no baseline
+    recovery; a timeout or dropped malformed frame both return ``None`` and do
+    not establish whether a sequence gap occurred.
     """
 
     def __init__(
@@ -351,6 +438,7 @@ class ZmqMarketSubscriber:
         max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES,
         wire_version: int = MARKET_WIRE_VERSION_LEGACY,
         subscription_key: MarketSubscriptionKey | None = None,
+        context_pool: ZmqMarketContextPool | None = None,
     ) -> None:
         _validate_subscriber_configuration(
             endpoint,
@@ -362,6 +450,8 @@ class ZmqMarketSubscriber:
             wire_version=wire_version,
             subscription_key=subscription_key,
         )
+        if context_pool is not None and type(context_pool) is not ZmqMarketContextPool:
+            raise ValueError("context_pool must be a ZmqMarketContextPool")
         self._endpoint = endpoint
         self.endpoint = endpoint
         self._expected_peer = expected_peer
@@ -376,14 +466,20 @@ class ZmqMarketSubscriber:
             else None
         )
         self._credentials = credentials
+        self._owner_pid = os.getpid()
         self._owner_thread = threading.get_ident()
         self._closed = False
         self._close_pending = False
         self._context = None
+        self._context_lease = None
         self._socket = None
         self._receiver = None
         try:
-            self._context = zmq.Context()
+            if context_pool is None:
+                self._context = zmq.Context()
+            else:
+                self._context_lease = context_pool.acquire()
+                self._context = self._context_lease.context
             self._socket = self._context.socket(zmq.SUB)
             if wire_version == MARKET_WIRE_VERSION_LEGACY:
                 self._receiver = _BoundedMultipartReceiver(self._socket)
@@ -489,13 +585,20 @@ class ZmqMarketSubscriber:
         else:
             self._receiver = None
         context = self._context
-        if context is not None:
+        lease = self._context_lease
+        if lease is not None:
+            lease.close()
+            self._context_lease = None
+            self._context = None
+        elif context is not None:
             context.term()
             self._context = None
         self._closed = True
         self._close_pending = False
 
     def _check_thread(self) -> None:
+        if os.getpid() != self._owner_pid:
+            raise RuntimeError("ZMQ market subscriber cannot cross a process boundary")
         if threading.get_ident() != self._owner_thread:
             raise RuntimeError("ZMQ market subscriber must be used and closed by its owning thread")
 

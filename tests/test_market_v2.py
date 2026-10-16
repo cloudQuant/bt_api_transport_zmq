@@ -416,6 +416,7 @@ def _fake_subscriber(socket_object: _FakeMultipartSocket, *, max_message_bytes: 
     subscriber._subscription_key = None
     subscriber._topic = None
     subscriber._credentials = None
+    subscriber._owner_pid = market_v2.os.getpid()
     subscriber._owner_thread = threading.get_ident()
     subscriber._closed = False
     subscriber._close_pending = False
