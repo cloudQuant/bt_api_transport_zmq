@@ -1,8 +1,9 @@
 """Authenticated ZeroMQ transport for the neutral v2 service protocol.
 
-Each transport owns a private ZMQ context. This is required for isolated ZAP
-authenticators and also makes socket ownership clear: construct, use, and close
-an instance on one thread. The transport authenticates peers with CURVE and
+Each transport owns its sockets and request state. Clients can optionally
+share a process-local ZMQ context through an explicit pool; without a pool,
+each client retains an independent context. Construct, use, and close each
+transport on one thread. The transport authenticates peers with CURVE and
 passes the trusted principal reference derived from ZAP metadata to the handler;
 identity claims in the envelope remain the SDK's responsibility to authorize.
 """
@@ -11,6 +12,7 @@ from __future__ import annotations
 
 import errno
 import math
+import os
 import re
 import threading
 import time
@@ -109,6 +111,111 @@ class ServiceTransportStartupCleanupError(ServiceTransportError):
         self.transport = transport
         self.cause_code = "startup_cleanup_failed"
         super().__init__("service transport startup cleanup failed; retry close")
+
+
+class ZmqServiceContextPool:
+    """Share a process-local ZMQ context across service clients.
+
+    Each client retains its own DEALER socket, receiver, CURVE keys and
+    request-correlation state. The context is terminated only after the last
+    client has closed its socket and released its lease. A live pool cannot be
+    used across a process boundary.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._context = None
+        self._owner_pid = os.getpid()
+        self._active_leases = 0
+        self._generation = 0
+        self._termination_pending = False
+
+    def acquire(self) -> _ZmqServiceContextLease:
+        current_pid = os.getpid()
+        if current_pid != self._owner_pid:
+            raise RuntimeError("service ZMQ context pool cannot cross a process boundary")
+        with self._lock:
+            # Check again under the lock. The pre-lock check prevents a forked
+            # child from blocking on an inherited locked RLock.
+            current_pid = os.getpid()
+            if current_pid != self._owner_pid:
+                raise RuntimeError("service ZMQ context pool cannot cross a process boundary")
+            if self._context is not None:
+                if self._termination_pending:
+                    raise RuntimeError("service ZMQ context termination is pending")
+            else:
+                self._context = zmq.Context(io_threads=1)
+                self._generation += 1
+            self._active_leases += 1
+            return _ZmqServiceContextLease(
+                self,
+                self._context,
+                current_pid,
+                self._generation,
+            )
+
+    def _release(self, lease: _ZmqServiceContextLease) -> None:
+        current_pid = os.getpid()
+        if current_pid != self._owner_pid or current_pid != lease._owner_pid:
+            raise RuntimeError("service ZMQ context lease cannot cross a process boundary")
+        with self._lock:
+            current_pid = os.getpid()
+            if current_pid != self._owner_pid or current_pid != lease._owner_pid:
+                raise RuntimeError("service ZMQ context lease cannot cross a process boundary")
+            if lease._pool is not self:
+                raise RuntimeError("service ZMQ context lease has the wrong owner")
+            if lease._released:
+                if (
+                    self._termination_pending
+                    and self._active_leases == 0
+                    and self._context is lease._context
+                    and self._generation == lease._generation
+                ):
+                    self._terminate_context_locked(lease._context, lease._generation)
+                return
+            if (
+                self._context is not lease._context
+                or self._generation != lease._generation
+                or self._active_leases <= 0
+            ):
+                raise RuntimeError("service ZMQ context lease state is inconsistent")
+            self._active_leases -= 1
+            lease._released = True
+            if self._active_leases == 0:
+                self._terminate_context_locked(lease._context, lease._generation)
+
+    def _terminate_context_locked(self, context: zmq.Context, generation: int) -> None:
+        if self._context is not context or self._generation != generation:
+            raise RuntimeError("service ZMQ context termination owner is inconsistent")
+        try:
+            context.term()
+        except BaseException:
+            self._termination_pending = True
+            raise
+        self._context = None
+        self._termination_pending = False
+
+
+class _ZmqServiceContextLease:
+    def __init__(
+        self,
+        pool: ZmqServiceContextPool,
+        context: zmq.Context,
+        owner_pid: int,
+        generation: int,
+    ) -> None:
+        self._pool = pool
+        self._context = context
+        self._owner_pid = owner_pid
+        self._generation = generation
+        self._released = False
+
+    @property
+    def context(self) -> zmq.Context:
+        return self._context
+
+    def close(self) -> None:
+        self._pool._release(self)
 
 
 class RequestNotSentError(TimeoutError):
@@ -387,6 +494,7 @@ class ZmqServiceClient:
         credentials: CurveClientCredentials,
         high_water_mark: int = DEFAULT_HIGH_WATER_MARK,
         max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES,
+        context_pool: ZmqServiceContextPool | None = None,
     ) -> None:
         _validate_endpoint(endpoint)
         if type(identity) is not WireIdentity or identity.role is not WireRole.SERVICE:
@@ -394,6 +502,8 @@ class ZmqServiceClient:
         if not isinstance(credentials, CurveClientCredentials):
             raise ValueError("Curve client credentials are required")
         _validate_limits(high_water_mark, max_message_bytes)
+        if context_pool is not None and type(context_pool) is not ZmqServiceContextPool:
+            raise ValueError("context_pool must be a ZmqServiceContextPool")
         self._identity = identity
         self._endpoint = endpoint
         self._high_water_mark = high_water_mark
@@ -409,6 +519,7 @@ class ZmqServiceClient:
         if bytes(reply_private_key.public_key) != z85.decode(credentials.public_key):
             raise ValueError("client CURVE public and secret keys do not match")
         self._reply_box = SealedBox(reply_private_key)
+        self._owner_pid = os.getpid()
         self._owner_thread = threading.get_ident()
         self._closed = False
         self._close_pending = False
@@ -417,10 +528,15 @@ class ZmqServiceClient:
         self._socket_message_ids = set()
         self._socket_retirement_pending = False
         self._context = None
+        self._context_lease = None
         self._socket = None
         self._receiver = None
         try:
-            self._context = zmq.Context()
+            if context_pool is None:
+                self._context = zmq.Context()
+            else:
+                self._context_lease = context_pool.acquire()
+                self._context = self._context_lease.context
             self._open_socket()
         except BaseException:
             try:
@@ -533,10 +649,16 @@ class ZmqServiceClient:
         self._check_thread()
         self._close_pending = True
         self._retire_socket()
-        context = self._context
-        if context is not None:
-            context.term()
+        lease = self._context_lease
+        if lease is not None:
+            lease.close()
+            self._context_lease = None
             self._context = None
+        else:
+            context = self._context
+            if context is not None:
+                context.term()
+                self._context = None
         self._closed = True
         self._close_pending = False
 
@@ -577,6 +699,8 @@ class ZmqServiceClient:
         self._socket_retirement_pending = False
 
     def _check_thread(self) -> None:
+        if os.getpid() != self._owner_pid:
+            raise RuntimeError("ZMQ client cannot cross a process boundary")
         if threading.get_ident() != self._owner_thread:
             raise RuntimeError("ZMQ client must be used and closed by its owning thread")
 
