@@ -841,6 +841,40 @@ def service_reply_fits(
     return True
 
 
+def service_reply_result_budget(
+    identity: WireIdentity,
+    request: WireEnvelope,
+    *,
+    max_message_bytes: int,
+) -> int:
+    """Return the exact JSON-byte budget available to a reply ``result``.
+
+    The budget uses the same reply header construction, canonical envelope
+    encoder, and sealed-frame overhead as :func:`service_reply_fits`. Replacing
+    the empty result object's two JSON bytes with a serialized result is the
+    only change to the envelope body, so the returned value is an exact limit,
+    not an estimate. A negative result means even an empty successful result
+    cannot fit the configured frame.
+    """
+
+    _validate_limits(DEFAULT_HIGH_WATER_MARK, max_message_bytes)
+    if type(identity) is not WireIdentity or identity.role is not WireRole.SERVICE:
+        raise ValueError("service identity must have the service role")
+    if type(request) is not WireEnvelope:
+        raise ValueError("request must be a WireEnvelope")
+    validate_request(request)
+
+    empty_payload = _handler_payload({"ok": True, "code": "OK", "result": {}})
+    empty_reply = _make_reply(identity, request, empty_payload)
+    encoded_empty_reply = encode_envelope(empty_reply, max_bytes=MAX_WIRE_MESSAGE_BYTES)
+    return (
+        max_message_bytes
+        - _REPLY_FRAME_OVERHEAD
+        - len(encoded_empty_reply)
+        + 2  # The empty result mapping serializes to exactly "{}".
+    )
+
+
 def _seal_reply(encoded_reply: bytes, recipient_key: PublicKey) -> bytes:
     sealed = SealedBox(recipient_key).encrypt(encoded_reply)
     if len(sealed) != len(encoded_reply) + bindings.crypto_box_SEALBYTES:

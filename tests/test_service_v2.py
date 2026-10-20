@@ -1684,3 +1684,49 @@ def test_server_enforces_thread_affinity_and_shuts_down_on_owner_thread() -> Non
         server["server"].serve_once(0)
     _wait_step(server, 0, handled=False)
     _join_server(server)
+
+
+def test_service_reply_result_budget_matches_exact_ascii_and_utf8_boundaries() -> None:
+    identity = _identity(WireRole.SERVICE, "service-a", "gateway-a")
+    request = _request("result-budget")
+    max_message_bytes = 16 * 1024
+    result_budget = service_v2.service_reply_result_budget(
+        identity,
+        request,
+        max_message_bytes=max_message_bytes,
+    )
+
+    ascii_empty_size = len(b'{"value":""}')
+    ascii_value_length = result_budget - ascii_empty_size
+    assert ascii_value_length >= 0
+    exact_ascii = {"value": "x" * ascii_value_length}
+    one_byte_over = {"value": "x" * (ascii_value_length + 1)}
+    assert service_v2.service_reply_fits(
+        identity,
+        request,
+        {"ok": True, "code": "OK", "result": exact_ascii},
+        max_message_bytes=max_message_bytes,
+    ) is True
+    assert service_v2.service_reply_fits(
+        identity,
+        request,
+        {"ok": True, "code": "OK", "result": one_byte_over},
+        max_message_bytes=max_message_bytes,
+    ) is False
+
+    utf8_empty_size = len(b'{"value":""}')
+    utf8_value_length = (result_budget - utf8_empty_size) // len("雪".encode("utf-8"))
+    exact_utf8 = {"value": "雪" * utf8_value_length}
+    one_codepoint_over = {"value": "雪" * (utf8_value_length + 1)}
+    assert service_v2.service_reply_fits(
+        identity,
+        request,
+        {"ok": True, "code": "OK", "result": exact_utf8},
+        max_message_bytes=max_message_bytes,
+    ) is True
+    assert service_v2.service_reply_fits(
+        identity,
+        request,
+        {"ok": True, "code": "OK", "result": one_codepoint_over},
+        max_message_bytes=max_message_bytes,
+    ) is False

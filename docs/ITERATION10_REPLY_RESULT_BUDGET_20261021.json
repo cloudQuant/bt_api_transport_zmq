@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "repository": "D:/bt_api_py/bt_api/bt_api_transport_zmq",
+  "branch": "dev",
+  "parent_commit": "acd74ba03494615aeb2d60423ac853e06029cba7",
+  "evidence_level": "LOCAL_REPLY_SIZE_COMPONENT_ONLY",
+  "change": "Expose the exact successful-reply result JSON byte budget using the existing envelope builder, encoder and sealed-frame overhead. No transport resource is created and existing reply encoding is unchanged.",
+  "source_checkout_sha256": {
+    "src/bt_api_transport_zmq/service_v2.py": "ee4c143ed23a1cf3c4115bb2f294d347c25e11fe87abb4d46e31e80c0872e7df",
+    "tests/test_service_v2.py": "bfb9e5248c654f42dbf1151f48f593b33cf856565b0b2d707920f0cd19fa00d0"
+  },
+  "verification": {
+    "root_static_review": "GO",
+    "independent_design_review": "GO",
+    "test": "tests/test_service_v2.py::test_service_reply_result_budget_matches_exact_ascii_and_utf8_boundaries",
+    "passed": 1,
+    "exit_code": 0,
+    "duration_seconds": 2.79,
+    "coverage": "Exact ASCII boundary, one-byte overflow and UTF-8 multibyte boundary checked against the existing full service_reply_fits implementation.",
+    "accepted_suites_repeated": false
+  },
+  "limits": {
+    "gateway_registry_integration": "Pending",
+    "performance_acceptance": false,
+    "formal_load01_pass": false
+  }
+}
