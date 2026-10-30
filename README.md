@@ -22,6 +22,17 @@ for offline/integration use with an injected authenticator. Messages reject
 secret-shaped keys and non-finite JSON values before they enter a queue or
 durable journal.
 
+## System role and authority boundary
+
+`bt_api_transport_zmq` owns provider-neutral ZeroMQ wire and service/market
+transport: message validation, bounded delivery, peer authentication, and
+server-configured principal and scope checks. It passes commands to an injected
+handler; that handler owns business admission, execution, and risk decisions.
+Transport authorization does not make this package the source of provider,
+account, or order state. A timeout can leave a write outcome unknown, and writes
+are not automatically retried. See the
+[Trading System Architecture](https://github.com/cloudQuant/backtrader/blob/dev/docs/TRADING_SYSTEM_ARCHITECTURE.md).
+
 ## Market PUB/SUB wire versions
 
 The market transport keeps wire version 1 as the default: the publisher sends
