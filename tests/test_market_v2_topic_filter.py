@@ -700,7 +700,8 @@ def test_wire_versions_and_required_key_are_validated_before_io(
         raise AssertionError("invalid wire configuration created a ZMQ context")
 
     monkeypatch.setattr(market_v2.zmq, "Context", no_context)
-    for invalid_version in (True, 0, 3):
+    # Version 3 is the iteration-60 MessagePack v1 wire; 4 is unknown.
+    for invalid_version in (True, 0, 4):
         with pytest.raises(ValueError, match="wire version"):
             validate_publisher_configuration(
                 "tcp://127.0.0.1:*",
@@ -717,7 +718,7 @@ def test_wire_versions_and_required_key_are_validated_before_io(
         _subscriber(
             "tcp://127.0.0.1:12345",
             client_credentials,
-            wire_version=3,
+            wire_version=4,
         )
     with pytest.raises(ValueError, match="requires a subscription key"):
         _subscriber(
