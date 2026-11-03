@@ -53,21 +53,10 @@ _MAX_SOCKET_OPTION_INT = 2_147_483_647
 _ZAP_DOMAIN = "bt-api-market-v2"
 MARKET_WIRE_VERSION_LEGACY = 1
 MARKET_WIRE_VERSION_TOPIC_FILTERED = 2
-# Iteration 60 (60.09): topic frame + MessagePack wire contract v1 body
-# (bt_api_base.wire_codec_v1) carrying a frozen Base container.
-MARKET_WIRE_VERSION_MSGPACK_V1 = 3
 _SUPPORTED_MARKET_WIRE_VERSIONS = frozenset(
-    {
-        MARKET_WIRE_VERSION_LEGACY,
-        MARKET_WIRE_VERSION_TOPIC_FILTERED,
-        MARKET_WIRE_VERSION_MSGPACK_V1,
-    }
+    {MARKET_WIRE_VERSION_LEGACY, MARKET_WIRE_VERSION_TOPIC_FILTERED}
 )
 _TOPIC_FILTERED_FRAME_PREFIX = b"\x00BTAPI-MARKET\x00\x02"
-# A distinct prefix per wire version: peers on different versions never match
-# each other's frames, so a version mismatch is "nothing received", never a
-# misinterpreted payload.
-_MSGPACK_V1_FRAME_PREFIX = b"\x00BTAPI-MARKET\x00\x03"
 _MAX_TOPIC_FRAME_BYTES = len(_TOPIC_FILTERED_FRAME_PREFIX) + len("market-") + 64 + 1
 
 
@@ -385,8 +374,6 @@ class ZmqMarketPublisher:
         self._check_thread()
         if self._closed or self._close_pending:
             raise RuntimeError("market publisher is closed")
-        if self._wire_version == MARKET_WIRE_VERSION_MSGPACK_V1:
-            raise ValueError("wire version 3 publishes Base containers: use try_publish_container")
         _validate_market_event(event, self._identity, self._scope)
         encoded = encode_envelope(event, max_bytes=self._max_message_bytes)
         try:
@@ -394,33 +381,8 @@ class ZmqMarketPublisher:
                 self._socket.send(encoded, flags=zmq.NOBLOCK)
             else:
                 key = MarketSubscriptionKey.from_dict(event.payload["key"])
-                topic = _market_topic_for_stream_id(key.stream_id, self._wire_version)
+                topic = _market_topic_for_stream_id(key.stream_id)
                 self._socket.send_multipart([topic, encoded], flags=zmq.NOBLOCK)
-        except zmq.Again:
-            return False
-        return True
-
-    def try_publish_container(self, kind: str, payload: object, stream: object) -> bool:
-        """Encode one frozen Base container once and send it (wire version 3).
-
-        ``stream`` is a ``bt_api_base.wire_codec_v1.StreamPosition`` whose
-        ``stream_id`` must be the canonical subscription stream ID; the topic
-        frame is derived from it. Returns local send acceptance only.
-        """
-
-        self._check_thread()
-        if self._closed or self._close_pending:
-            raise RuntimeError("market publisher is closed")
-        if self._wire_version != MARKET_WIRE_VERSION_MSGPACK_V1:
-            raise ValueError("container publishing requires market wire version 3")
-        from bt_api_base.wire_codec_v1 import encode_message
-
-        encoded = encode_message(kind, payload, stream=stream)
-        if len(encoded) > self._max_message_bytes:
-            raise ValueError("market message exceeds the configured limit")
-        topic = _market_topic_for_stream_id(stream.stream_id, self._wire_version)
-        try:
-            self._socket.send_multipart([topic, encoded], flags=zmq.NOBLOCK)
         except zmq.Again:
             return False
         return True
@@ -499,8 +461,8 @@ class ZmqMarketSubscriber:
         self._wire_version = wire_version
         self._subscription_key = subscription_key
         self._topic = (
-            _market_topic_for_stream_id(subscription_key.stream_id, wire_version)
-            if wire_version != MARKET_WIRE_VERSION_LEGACY
+            _market_topic_for_stream_id(subscription_key.stream_id)
+            if wire_version == MARKET_WIRE_VERSION_TOPIC_FILTERED
             else None
         )
         self._credentials = credentials
@@ -527,7 +489,7 @@ class ZmqMarketSubscriber:
                 assert self._topic is not None
                 subscription = self._topic
             socket_max_message_bytes = max_message_bytes
-            if wire_version != MARKET_WIRE_VERSION_LEGACY:
+            if wire_version == MARKET_WIRE_VERSION_TOPIC_FILTERED:
                 # The application limit covers the unchanged envelope. ZMQ's
                 # inbound limit covers the full multipart message, including
                 # its bounded topic frame.
@@ -581,8 +543,6 @@ class ZmqMarketSubscriber:
                 raise ValueError("timeout must be a bounded non-negative number of seconds")
             poll_timeout_ms = math.ceil(timeout * 1000)
 
-        if self._wire_version == MARKET_WIRE_VERSION_MSGPACK_V1:
-            raise ValueError("wire version 3 delivers Base containers: use receive_container")
         if self._socket.poll(poll_timeout_ms, zmq.POLLIN) == 0:
             return None
         if self._wire_version == MARKET_WIRE_VERSION_LEGACY:
@@ -609,45 +569,6 @@ class ZmqMarketSubscriber:
         except ValueError:
             return None
         return event
-
-    def receive_container(self, *, timeout_ms: int | None = None) -> object | None:
-        """Decode one wire-version-3 message once into a frozen Base container.
-
-        Returns a ``bt_api_base.wire_codec_v1.WireMessageV1`` or ``None`` on
-        timeout or when an invalid frame is dropped (as ``receive`` does). The
-        topic frame and the message's own ``stream_id`` must both match this
-        subscription; a message published to the wrong topic is dropped.
-        """
-
-        self._check_thread()
-        if self._closed or self._close_pending:
-            raise RuntimeError("market subscriber is closed")
-        if self._wire_version != MARKET_WIRE_VERSION_MSGPACK_V1:
-            raise ValueError("container delivery requires market wire version 3")
-        if timeout_ms is not None and (
-            type(timeout_ms) is not int or not 0 <= timeout_ms <= _MAX_SOCKET_OPTION_INT
-        ):
-            raise ValueError("timeout_ms must be a bounded non-negative integer")
-        if self._socket.poll(timeout_ms, zmq.POLLIN) == 0:
-            return None
-        parts = self._receiver.receive()
-        if parts is None:
-            return None
-        topic, frame = parts
-        if len(topic) > _MAX_TOPIC_FRAME_BYTES or bytes(topic) != self._topic:
-            return None
-        if frame is None or len(frame) > self._max_message_bytes:
-            return None
-        from bt_api_base.wire_codec_v1 import WireCodecError, decode_message
-
-        try:
-            message = decode_message(bytes(frame))
-        except WireCodecError:
-            return None
-        assert self._subscription_key is not None
-        if message.stream.stream_id != self._subscription_key.stream_id:
-            return None
-        return message
 
     def close(self) -> None:
         """Close owned resources; a failed stage can be retried on this thread."""
@@ -729,10 +650,10 @@ def _validate_subscriber_configuration(
         raise ValueError("expected market scope must be a WireScope")
     _validate_public_market_scope(expected_scope)
     _validate_market_wire_version(wire_version)
-    if wire_version != MARKET_WIRE_VERSION_LEGACY:
+    if wire_version == MARKET_WIRE_VERSION_TOPIC_FILTERED:
         if type(subscription_key) is not MarketSubscriptionKey:
             raise ValueError("topic-filtered market transport requires a subscription key")
-        _market_topic_for_stream_id(subscription_key.stream_id, wire_version)
+        _market_topic_for_stream_id(subscription_key.stream_id)
     elif subscription_key is not None:
         raise ValueError("legacy market transport does not accept a subscription key")
     if not isinstance(credentials, CurveClientCredentials):
@@ -790,9 +711,7 @@ def _validate_market_wire_version(version: int) -> None:
         raise ValueError("unsupported market wire version")
 
 
-def _market_topic_for_stream_id(
-    stream_id: str, wire_version: int = MARKET_WIRE_VERSION_TOPIC_FILTERED
-) -> bytes:
+def _market_topic_for_stream_id(stream_id: str) -> bytes:
     if (
         type(stream_id) is not str
         or len(stream_id) != len("market-") + 64
@@ -800,12 +719,7 @@ def _market_topic_for_stream_id(
         or any(character not in "0123456789abcdef" for character in stream_id[len("market-") :])
     ):
         raise ValueError("market topic requires a canonical subscription stream ID")
-    prefix = (
-        _MSGPACK_V1_FRAME_PREFIX
-        if wire_version == MARKET_WIRE_VERSION_MSGPACK_V1
-        else _TOPIC_FILTERED_FRAME_PREFIX
-    )
-    return prefix + stream_id.encode("ascii") + b"\x00"
+    return _TOPIC_FILTERED_FRAME_PREFIX + stream_id.encode("ascii") + b"\x00"
 
 
 def _copy_principals(principals: Mapping[bytes, str]) -> Mapping[bytes, str]:
@@ -860,41 +774,3 @@ def _configure_subscriber_socket(
     socket.setsockopt(zmq.LINGER, 0)
     socket.setsockopt(zmq.RCVHWM, high_water_mark)
     socket.setsockopt(zmq.MAXMSGSIZE, max_message_bytes)
-
-
-class ContainerSequenceMonitor:
-    """Observe stream continuity of wire-version-3 messages (one per consumer).
-
-    Each receiving consumer keeps its own monitor, so one consumer's gap or
-    restart is never hidden by another's health. ``observe`` returns:
-
-    * ``"FIRST"`` for the first message of a stream,
-    * ``"IN_ORDER"`` when ``sequence`` is exactly the next one,
-    * ``"GAP"`` when messages were skipped (PUB/SUB may drop under load; a
-      consumer that needs every tick must resynchronize from a snapshot),
-    * ``"DUPLICATE"`` for a sequence at or below the last one seen,
-    * ``"NEW_EPOCH"`` when the stream restarted under a new epoch.
-    """
-
-    def __init__(self) -> None:
-        self._last: dict[str, tuple[str, int]] = {}
-
-    def observe(self, message: object) -> str:
-        stream = getattr(message, "stream", None)
-        stream_id = getattr(stream, "stream_id", None)
-        epoch = getattr(stream, "epoch", None)
-        sequence = getattr(stream, "sequence", None)
-        if type(stream_id) is not str or type(epoch) is not str or type(sequence) is not int:
-            raise ValueError("message has no stream position")
-        previous = self._last.get(stream_id)
-        if previous is None:
-            self._last[stream_id] = (epoch, sequence)
-            return "FIRST"
-        last_epoch, last_sequence = previous
-        if epoch != last_epoch:
-            self._last[stream_id] = (epoch, sequence)
-            return "NEW_EPOCH"
-        if sequence <= last_sequence:
-            return "DUPLICATE"
-        self._last[stream_id] = (epoch, sequence)
-        return "IN_ORDER" if sequence == last_sequence + 1 else "GAP"
