@@ -164,6 +164,11 @@ class _MarketPrincipalRegistry:
         return domain == _ZAP_DOMAIN and client_key in self._principals
 
 
+# Receiver result: the socket had no queued frame (nothing was consumed).
+# Distinct from ``None`` (a frame was consumed and dropped).
+_NOTHING_QUEUED = object()
+
+
 class _BoundedMultipartReceiver:
     """Read one bounded frame and incrementally discard multipart messages."""
 
@@ -172,29 +177,30 @@ class _BoundedMultipartReceiver:
         self._discarding = False
 
     def receive(self) -> Optional[zmq.Frame]:  # noqa: UP045 -- Python 3.9 compatibility.
+        """One frame; ``None`` if dropped; ``_NOTHING_QUEUED`` if nothing was read."""
         if self._discarding:
-            self._drain()
-            return None
+            return self._drain()
 
         try:
             frame = self._socket.recv(flags=zmq.NOBLOCK, copy=False)
         except zmq.Again:
-            return None
+            return _NOTHING_QUEUED
         if self._socket.getsockopt(zmq.RCVMORE):
             self._discarding = True
             self._drain()
             return None
         return frame
 
-    def _drain(self) -> None:
-        for _ in range(MAX_DRAIN_FRAMES_PER_CALL):
+    def _drain(self) -> object:
+        for index in range(MAX_DRAIN_FRAMES_PER_CALL):
             try:
                 self._socket.recv(flags=zmq.NOBLOCK, copy=False)
             except zmq.Again:
-                return
+                return _NOTHING_QUEUED if index == 0 else None
             if not self._socket.getsockopt(zmq.RCVMORE):
                 self._discarding = False
-                return
+                return None
+        return None
 
 
 class _BoundedTopicReceiver:
@@ -205,14 +211,14 @@ class _BoundedTopicReceiver:
         self._discarding = False
 
     def receive(self) -> tuple[zmq.Frame, zmq.Frame] | None:
+        """Topic/envelope frames; ``None`` if dropped; ``_NOTHING_QUEUED`` if none read."""
         if self._discarding:
-            self._drain()
-            return None
+            return self._drain()
 
         try:
             topic = self._socket.recv(flags=zmq.NOBLOCK, copy=False)
         except zmq.Again:
-            return None
+            return _NOTHING_QUEUED
         if not self._socket.getsockopt(zmq.RCVMORE):
             return None
 
@@ -228,15 +234,16 @@ class _BoundedTopicReceiver:
             return None
         return topic, envelope
 
-    def _drain(self) -> None:
-        for _ in range(MAX_DRAIN_FRAMES_PER_CALL):
+    def _drain(self) -> object:
+        for index in range(MAX_DRAIN_FRAMES_PER_CALL):
             try:
                 self._socket.recv(flags=zmq.NOBLOCK, copy=False)
             except zmq.Again:
-                return
+                return _NOTHING_QUEUED if index == 0 else None
             if not self._socket.getsockopt(zmq.RCVMORE):
                 self._discarding = False
-                return
+                return None
+        return None
 
 
 class MarketTransportError(RuntimeError):
@@ -731,12 +738,23 @@ class ZmqMarketSubscriber:
                 raise ValueError("timeout must be a bounded non-negative number of seconds")
             poll_timeout_ms = math.ceil(timeout * 1000)
 
-        if self._socket.poll(poll_timeout_ms, zmq.POLLIN) == 0:
-            return None
+        # Read first and poll only when nothing is queued: under load every
+        # frame is already queued and the poll call per message is pure cost.
+        # The result is unchanged: a queued frame is what a poll would report
+        # ready, and an empty socket still waits up to the timeout.
+        received = self._receiver.receive()
+        if received is _NOTHING_QUEUED:
+            if self._socket.poll(poll_timeout_ms, zmq.POLLIN) == 0:
+                return None
+            received = self._receiver.receive()
+            if received is _NOTHING_QUEUED:
+                # Ready but nothing readable: reported as before (v1 None,
+                # v2 counted as an invalid drop).
+                received = None
         if self._wire_version == MARKET_WIRE_VERSION_LEGACY:
-            frame = self._receiver.receive()
+            frame = received
         else:
-            parts = self._receiver.receive()
+            parts = received
             if parts is None:
                 self.dropped_invalid += 1
                 return None
@@ -862,6 +880,9 @@ def _bind_with_retry(socket: zmq.Socket, endpoint: str) -> None:
             time.sleep(_REBIND_DELAY_SECONDS)
 
 
+_MARKET_PAYLOAD_KEYS = frozenset({"key", "data"})
+
+
 def _validate_market_event(
     event: WireEnvelope,
     expected_identity: WireIdentity,
@@ -880,7 +901,7 @@ def _validate_market_event(
         or header.schema_version != MARKET_EVENT_SCHEMA_VERSION
     ):
         raise ValueError("market event schema or operation is unsupported")
-    if set(event.payload) != {"key", "data"}:
+    if event.payload.keys() != _MARKET_PAYLOAD_KEYS:
         raise ValueError("market event payload must contain exactly key and data")
     raw_key = event.payload["key"]
     if key_cache is not None and key_cache and key_cache[0] == raw_key:
@@ -897,7 +918,8 @@ def _validate_market_event(
             key_cache[:] = [raw_key, key]
     if header.stream_id != key.stream_id:
         raise ValueError("market event stream does not match its subscription key")
-    if not isinstance(event.payload["data"], Mapping):
+    data = event.payload["data"]
+    if type(data) is not MappingProxyType and not isinstance(data, Mapping):
         raise ValueError("market event data must be an object")
     return key
 

@@ -462,6 +462,8 @@ class _FakeMultipartSocket:
         assert flags == zmq.NOBLOCK
         assert copy is False
         if self.active is None:
+            if not self.messages:
+                raise zmq.Again()
             self.active = self.messages.popleft()
             self.offset = 0
         frame = self.active[self.offset]

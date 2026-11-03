@@ -389,6 +389,8 @@ class _FakeMultipartSocket:
         assert flags == zmq.NOBLOCK
         assert copy is False
         if self.active is None:
+            if not self.messages:
+                raise zmq.Again()
             self.active = self.messages.popleft()
             self.offset = 0
         result = self.active[self.offset]
@@ -447,6 +449,49 @@ def test_subscriber_drops_oversized_malformed_multipart_and_foreign_scope_frames
     received = subscriber.receive(timeout=0)
     assert received == valid
     assert socket_object.receive_count == 8
+
+
+def test_subscriber_reads_queued_frames_without_polling_and_polls_only_when_empty() -> None:
+    """R2-A: a queued frame is read directly; the poll (wait) runs only when empty.
+
+    Results and drop counters equal the former poll-then-read order.
+    """
+
+    valid = _event()
+    messages = [
+        [encode_envelope(valid)],
+        [b"{not-msgpack"],
+        [encode_envelope(valid), b"second-frame"],
+        [encode_envelope(valid)],
+    ]
+    socket_object = _FakeMultipartSocket(messages)
+    subscriber = _fake_subscriber(socket_object, max_message_bytes=2048)
+
+    assert subscriber.receive(timeout=5) == valid
+    assert subscriber.receive(timeout=5) is None  # malformed: dropped
+    assert subscriber.receive(timeout=5) is None  # multipart: dropped
+    assert subscriber.receive(timeout=5) == valid
+    assert socket_object.poll_timeouts == []  # every frame was already queued
+    assert subscriber.dropped_invalid == 2
+
+    assert subscriber.receive(timeout_ms=7) is None  # nothing queued: waits, times out
+    assert socket_object.poll_timeouts == [7]
+    assert subscriber.dropped_invalid == 2  # a timeout is not a drop
+
+
+def test_subscriber_discarding_state_with_empty_socket_waits_without_counting() -> None:
+    socket_object = _FakeMultipartSocket([[b"a", b"b", b"c"]])
+    subscriber = _fake_subscriber(socket_object)
+    receiver = subscriber._receiver
+    # Read the first frame of a multipart message, then leave it half-drained.
+    socket_object.recv(flags=zmq.NOBLOCK, copy=False)
+    receiver._discarding = True
+    assert subscriber.receive(timeout=0) is None  # drains the rest: one drop
+    assert subscriber.dropped_invalid == 1
+    assert socket_object.poll_timeouts == []
+    assert subscriber.receive(timeout=0) is None  # empty socket: timeout only
+    assert subscriber.dropped_invalid == 1
+    assert socket_object.poll_timeouts == [0]
 
 
 def test_bounded_multipart_drain_continues_on_later_receive_call() -> None:
