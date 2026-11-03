@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import importlib.util
 import json
 import queue
 import socket
-import sys
 import threading
 import time
 from contextlib import suppress
-from pathlib import Path
 from typing import Any, Optional
 
 import pytest
@@ -438,9 +435,11 @@ def test_malformed_and_unsupported_version_messages_are_dropped() -> None:
         _wait_step(server, 0)
         assert not client.poll(50, zmq.POLLIN)
 
-        unsupported_version = encode_envelope(_request("old-version")).replace(
-            b'"protocol_version":2', b'"protocol_version":1', 1
-        )
+        import msgpack
+
+        old = msgpack.unpackb(encode_envelope(_request("old-version")), raw=False)
+        old["header"]["protocol_version"] = 2
+        unsupported_version = msgpack.packb(old, use_bin_type=True)
         _send_raw(client, unsupported_version)
         _wait_step(server, 1)
         assert not client.poll(50, zmq.POLLIN)
@@ -452,32 +451,22 @@ def test_malformed_and_unsupported_version_messages_are_dropped() -> None:
 
 
 def test_legacy_forwarding_order_command_is_dropped_by_live_v2_curve_server() -> None:
-    schema_path = (
-        Path(__file__).resolve().parents[3]
-        / "bt_api_py"
-        / "forwarding"
-        / "schema.py"
-    )
-    module_name = "_iteration10_mig02_legacy_forwarding_schema"
-    spec = importlib.util.spec_from_file_location(module_name, schema_path)
-    assert spec is not None and spec.loader is not None
-    legacy_schema = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = legacy_schema
-    try:
-        spec.loader.exec_module(legacy_schema)
-        old_command = legacy_schema.OrderCommand(
-            strategy_id="strategy-mig02",
-            account_id="account-mig02",
-            symbol="BTC-USDT",
-            side="buy",
-            size="1",
-            command_type="place_order",
-            order_type="market",
-            idempotency_key="mig02-legacy-command",
-        )
-        legacy_frame = legacy_schema.serialize_message(old_command)
-    finally:
-        sys.modules.pop(module_name, None)
+    # The retired forwarding module wrote flat JSON order commands like this
+    # one (the module itself is gone; its frame shape is reproduced here).
+    legacy_frame = json.dumps(
+        {
+            "_message_type": "order_command",
+            "schema_version": "1.0",
+            "strategy_id": "strategy-mig02",
+            "account_id": "account-mig02",
+            "symbol": "BTC-USDT",
+            "side": "buy",
+            "size": "1",
+            "command_type": "place_order",
+            "order_type": "market",
+            "idempotency_key": "mig02-legacy-command",
+        }
+    ).encode("utf-8")
 
     legacy_payload = json.loads(legacy_frame.decode("utf-8"))
     assert legacy_payload["_message_type"] == "order_command"
@@ -1696,7 +1685,11 @@ def test_service_reply_result_budget_matches_exact_ascii_and_utf8_boundaries() -
         max_message_bytes=max_message_bytes,
     )
 
-    ascii_empty_size = len(b'{"value":""}')
+    # Sizes are v3 MessagePack bytes of the result map. A string header grows
+    # with its length (fixstr/str8/str16), so measure at the target length.
+    from bt_api_base.service_protocol import encode_wire_value
+
+    ascii_empty_size = len(encode_wire_value({"value": "x" * 1000})) - 1000
     ascii_value_length = result_budget - ascii_empty_size
     assert ascii_value_length >= 0
     exact_ascii = {"value": "x" * ascii_value_length}
@@ -1714,8 +1707,8 @@ def test_service_reply_result_budget_matches_exact_ascii_and_utf8_boundaries() -
         max_message_bytes=max_message_bytes,
     ) is False
 
-    utf8_empty_size = len(b'{"value":""}')
-    utf8_value_length = (result_budget - utf8_empty_size) // len("雪".encode("utf-8"))
+    utf8_empty_size = len(encode_wire_value({"value": "x" * 3000})) - 3000
+    utf8_value_length = (result_budget - utf8_empty_size) // len("雪".encode())
     exact_utf8 = {"value": "雪" * utf8_value_length}
     one_codepoint_over = {"value": "雪" * (utf8_value_length + 1)}
     assert service_v2.service_reply_fits(

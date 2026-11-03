@@ -847,14 +847,15 @@ def service_reply_result_budget(
     *,
     max_message_bytes: int,
 ) -> int:
-    """Return the exact JSON-byte budget available to a reply ``result``.
+    """Return the exact encoded-byte budget available to a reply ``result``.
 
-    The budget uses the same reply header construction, canonical envelope
-    encoder, and sealed-frame overhead as :func:`service_reply_fits`. Replacing
-    the empty result object's two JSON bytes with a serialized result is the
-    only change to the envelope body, so the returned value is an exact limit,
-    not an estimate. A negative result means even an empty successful result
-    cannot fit the configured frame.
+    Measured in v3 MessagePack bytes (``bt_api_base.service_protocol.
+    encode_wire_value``). The budget uses the same reply header construction,
+    canonical envelope encoder, and sealed-frame overhead as
+    :func:`service_reply_fits`. Replacing the empty result map's single byte
+    (``0x80``) with an encoded result is the only change to the envelope body,
+    so the returned value is an exact limit, not an estimate. A negative
+    result means even an empty successful result cannot fit the frame.
     """
 
     _validate_limits(DEFAULT_HIGH_WATER_MARK, max_message_bytes)
@@ -871,7 +872,7 @@ def service_reply_result_budget(
         max_message_bytes
         - _REPLY_FRAME_OVERHEAD
         - len(encoded_empty_reply)
-        + 2  # The empty result mapping serializes to exactly "{}".
+        + 1  # The empty result map encodes to exactly one byte (0x80).
     )
 
 

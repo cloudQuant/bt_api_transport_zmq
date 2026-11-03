@@ -68,7 +68,7 @@ def test_exact_sealed_frame_boundary_matches_server_reply_encoding() -> None:
     exact_cap = len(sealed)
 
     assert "🧪".encode() in encoded
-    assert b'\\"quoted\\"' in encoded
+    assert b'quoted "text"' in encoded  # MessagePack strings are not escaped
     assert len(sealed) == len(encoded) + service_v2._REPLY_FRAME_OVERHEAD
     assert service_v2.service_reply_fits(identity, request, payload, max_message_bytes=exact_cap)
     assert not service_v2.service_reply_fits(

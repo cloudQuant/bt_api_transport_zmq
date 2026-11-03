@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import os
 import queue
 import threading
 from typing import Any
 
 import pytest
 import zmq
-
 from bt_api_base.service_protocol import (
     WIRE_PROTOCOL_VERSION,
     WireEnvelope,
@@ -17,6 +15,7 @@ from bt_api_base.service_protocol import (
     WireRole,
     WireScope,
 )
+
 from bt_api_transport_zmq.server import CurveClientCredentials, CurveServerCredentials
 from bt_api_transport_zmq.service_v2 import (
     RequestOutcomeUnknownError,
