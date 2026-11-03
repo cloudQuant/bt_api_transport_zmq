@@ -23,6 +23,7 @@ from __future__ import annotations
 import math
 import os
 import threading
+import time
 from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Optional
@@ -335,6 +336,10 @@ class ZmqMarketPublisher:
         )
         self._grants = _copy_stream_grants(stream_grants, copied_principals, wire_version)
         self.denied_subscriptions = 0
+        # Backpressure: sends refused locally because the socket would block
+        # (PUB may additionally drop silently for a slow peer at its HWM).
+        self.dropped_would_block = 0
+        self.reconfigurations = 0
         self._identity = identity
         self._scope = scope
         self._principals = copied_principals
@@ -359,6 +364,9 @@ class ZmqMarketPublisher:
                 raise ServiceTransportStartupCleanupError(self) from None
             raise
 
+    #: True only while ``reconfigure`` rebuilds the socket on its old endpoint.
+    _rebinding = False
+
     def _open(self, endpoint: str) -> None:
         if self._grants is None:
             self._socket = self._context.socket(zmq.PUB)
@@ -374,13 +382,20 @@ class ZmqMarketPublisher:
         self._socket.curve_secretkey = self._credentials.secret_key
         self._socket.curve_server = True
 
-        self._authenticator = ThreadAuthenticator(self._context)
-        self._authenticator.configure_curve_callback(
-            domain=_ZAP_DOMAIN,
-            credentials_provider=_MarketPrincipalRegistry(self._principals),
-        )
-        self._authenticator.start()
-        self._socket.bind(endpoint)
+        if self._authenticator is None:
+            self._registry = _MarketPrincipalRegistry(self._principals)
+            self._authenticator = ThreadAuthenticator(self._context)
+            self._authenticator.configure_curve_callback(
+                domain=_ZAP_DOMAIN,
+                credentials_provider=self._registry,
+            )
+            self._authenticator.start()
+        if self._rebinding:
+            # The closed socket's listener is released asynchronously by the
+            # ZMQ I/O thread; retry the same endpoint for a bounded time.
+            _bind_with_retry(self._socket, endpoint)
+        else:
+            self._socket.bind(endpoint)
         actual_endpoint = self._socket.getsockopt(zmq.LAST_ENDPOINT)
         self.endpoint = actual_endpoint.decode("utf-8", errors="strict")
 
@@ -479,17 +494,41 @@ class ZmqMarketPublisher:
             raise ValueError("reconfigure cannot switch stream authorization on or off")
         endpoint = self.endpoint
         self._close_pending = True
-        self._close_socket()
+        # Keep the ZAP authenticator: restarting it in the same context races
+        # the asynchronous unbind of ``inproc://zeromq.zap.01`` (EADDRINUSE).
+        # Only the XPUB socket is rebuilt; every peer re-handshakes against
+        # the replaced audience map below.
+        self._close_socket(keep_authenticator=True)
         self._principals = copied
+        self._registry._principals = copied
         self._grants = grants
         # Any partially opened replacement remains owned for close() if this
         # fails; close-pending prevents sending through an unbound socket.
-        self._open(endpoint)
+        self._rebinding = True
+        try:
+            self._open(endpoint)
+        finally:
+            self._rebinding = False
         self._close_pending = False
+        self.reconfigurations += 1
 
-    def _close_socket(self) -> None:
+    def regrant(self, stream_grants: Mapping[str, object]) -> bool:
+        """Enforce new stream grants for the same audience; ``True`` once live.
+
+        The hub's runtime-revocation callback (``GatewayMarketHub.
+        set_partitioned_publisher(regrant=...)``). It rebuilds the socket like
+        ``reconfigure``; it returns ``True`` only when the rebuilt socket's
+        enforced grants equal the requested ones.
+        """
+
+        self.reconfigure(self._principals, stream_grants=stream_grants)
+        enforced = self.enforced_stream_grants
+        expected = _copy_stream_grants(stream_grants, self._principals, self._wire_version)
+        return enforced is not None and dict(enforced) == dict(expected)
+
+    def _close_socket(self, *, keep_authenticator: bool = False) -> None:
         authenticator = self._authenticator
-        if authenticator is not None:
+        if authenticator is not None and not keep_authenticator:
             authenticator.stop()
             self._authenticator = None
         socket = self._socket
@@ -520,6 +559,7 @@ class ZmqMarketPublisher:
                 topic = _market_topic_for_stream_id(key.stream_id)
                 self._socket.send_multipart([topic, encoded], flags=zmq.NOBLOCK)
         except zmq.Again:
+            self.dropped_would_block += 1
             return False
         return True
 
@@ -555,6 +595,14 @@ class ZmqMarketSubscriber:
     recovery; a timeout or dropped malformed frame both return ``None`` and do
     not establish whether a sequence gap occurred.
     """
+
+    # Class-level defaults keep receiver counters defined for every instance.
+    _revoked_reason: str | None = None
+    _authorization_cut: tuple[str, int] | None = None
+    authorization_generation = 0
+    dropped_invalid = 0
+    dropped_revoked = 0
+    dropped_stale_authorization = 0
 
     def __init__(
         self,
@@ -598,6 +646,16 @@ class ZmqMarketSubscriber:
         self._credentials = credentials
         self._owner_pid = os.getpid()
         self._owner_thread = threading.get_ident()
+        # Receiver-side authorization state (iteration 60, G2): after
+        # ``revoke`` every frame is dropped until ``regrant`` names the new
+        # authorization cut; frames of that epoch at or below it are stale
+        # and dropped. Already-returned events cannot be recalled.
+        self._revoked_reason: str | None = None
+        self._authorization_cut: tuple[str, int] | None = None
+        self.authorization_generation = 0
+        self.dropped_invalid = 0
+        self.dropped_revoked = 0
+        self.dropped_stale_authorization = 0
         self._closed = False
         self._close_pending = False
         self._context = None
@@ -680,11 +738,17 @@ class ZmqMarketSubscriber:
         else:
             parts = self._receiver.receive()
             if parts is None:
+                self.dropped_invalid += 1
                 return None
             topic, frame = parts
             if len(topic) > _MAX_TOPIC_FRAME_BYTES or bytes(topic) != self._topic:
+                self.dropped_invalid += 1
                 return None
+        if self._revoked_reason is not None:
+            self.dropped_revoked += 1
+            return None
         if frame is None or len(frame) > self._max_message_bytes:
+            self.dropped_invalid += 1
             return None
         try:
             event = decode_envelope(bytes(frame), max_bytes=self._max_message_bytes)
@@ -696,10 +760,59 @@ class ZmqMarketSubscriber:
                     event.header.stream_id != self._subscription_key.stream_id
                     or actual_key != self._subscription_key
                 ):
+                    self.dropped_invalid += 1
                     return None
         except ValueError:
+            self.dropped_invalid += 1
+            return None
+        cut = self._authorization_cut
+        if (
+            cut is not None
+            and event.header.stream_epoch == cut[0]
+            and event.header.sequence <= cut[1]
+        ):
+            self.dropped_stale_authorization += 1
             return None
         return event
+
+    @property
+    def revoked(self) -> str | None:
+        """The revocation reason while delivery is refused, else ``None``."""
+        return self._revoked_reason
+
+    def revoke(self, reason: str = "AUTHORIZATION_REVOKED") -> None:
+        """Stop returning events: the caller learned its grant was revoked.
+
+        Frames still queued in this socket were published under the old
+        authorization; they are dropped (counted in ``dropped_revoked``).
+        The caller's stream is interrupted until ``regrant`` and a resync.
+        """
+
+        self._check_thread()
+        if type(reason) is not str or not reason:
+            raise ValueError("revocation reason must be a non-empty string")
+        self._revoked_reason = reason
+
+    def regrant(self, *, generation: int, epoch: str, after_sequence: int) -> None:
+        """Accept events again, strictly after a re-granted authorization cut.
+
+        ``epoch``/``after_sequence`` is the cut the caller resynchronized from
+        (for example the Gateway's re-grant floor). Events of that epoch at or
+        below the cut are stale (``dropped_stale_authorization``); an event of
+        another epoch is a stream reset the caller's cursor must resync. A
+        generation must increase: an older or repeated grant is refused.
+        """
+
+        self._check_thread()
+        if type(generation) is not int or generation <= self.authorization_generation:
+            raise ValueError("authorization generation must increase")
+        if type(epoch) is not str or not epoch:
+            raise ValueError("authorization cut epoch must be a non-empty string")
+        if type(after_sequence) is not int or after_sequence < 0:
+            raise ValueError("authorization cut sequence must be a non-negative integer")
+        self.authorization_generation = generation
+        self._authorization_cut = (epoch, after_sequence)
+        self._revoked_reason = None
 
     def close(self) -> None:
         """Close owned resources; a failed stage can be retried on this thread."""
@@ -732,6 +845,21 @@ class ZmqMarketSubscriber:
             raise RuntimeError("ZMQ market subscriber cannot cross a process boundary")
         if threading.get_ident() != self._owner_thread:
             raise RuntimeError("ZMQ market subscriber must be used and closed by its owning thread")
+
+
+_REBIND_ATTEMPTS = 200
+_REBIND_DELAY_SECONDS = 0.01
+
+
+def _bind_with_retry(socket: zmq.Socket, endpoint: str) -> None:
+    for attempt in range(_REBIND_ATTEMPTS):
+        try:
+            socket.bind(endpoint)
+            return
+        except zmq.ZMQError as error:
+            if error.errno != zmq.EADDRINUSE or attempt == _REBIND_ATTEMPTS - 1:
+                raise
+            time.sleep(_REBIND_DELAY_SECONDS)
 
 
 def _validate_market_event(
