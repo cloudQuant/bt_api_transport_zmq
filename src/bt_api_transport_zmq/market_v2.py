@@ -3,8 +3,16 @@
 The publisher's principal map is a server-owned audience ACL: listed CURVE
 keys are authorized to connect and receive traffic. Version 1 sends every
 single-frame event to that audience; version 2 adds per-topic delivery
-filtering, but the topic is not an authorization decision. This module does
-not replay history or acknowledge delivery. Construct, use, and close each
+filtering, but the topic is not an authorization decision. A version-2
+publisher built with ``stream_grants`` additionally authorizes each
+subscription: it runs an XPUB socket in manual subscription mode and applies
+a subscription only when the requesting peer's CURVE identity (the ZAP
+``User-Id``) maps to a principal granted that exact stream, so an
+unauthorized subscriber receives nothing for that stream even if it asks for
+its topic (iteration 60, acceptance report G3). ``reconfigure`` replaces the
+audience and grants; peers reconnect and are authorized again, so a revoked
+principal stops receiving. This module does not replay history or
+acknowledge delivery. Construct, use, and close each
 transport on one thread and process. Subscribers may lease a process-local
 shared context but always own distinct sockets; publishers own their context,
 socket, and authenticator.
@@ -313,6 +321,7 @@ class ZmqMarketPublisher:
         high_water_mark: int = DEFAULT_HIGH_WATER_MARK,
         max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES,
         wire_version: int = MARKET_WIRE_VERSION_LEGACY,
+        stream_grants: Mapping[str, object] | None = None,
     ) -> None:
         copied_principals = _validated_publisher_configuration(
             endpoint,
@@ -324,6 +333,8 @@ class ZmqMarketPublisher:
             max_message_bytes=max_message_bytes,
             wire_version=wire_version,
         )
+        self._grants = _copy_stream_grants(stream_grants, copied_principals, wire_version)
+        self.denied_subscriptions = 0
         self._identity = identity
         self._scope = scope
         self._principals = copied_principals
@@ -340,28 +351,151 @@ class ZmqMarketPublisher:
         self.endpoint = endpoint
         try:
             self._context = zmq.Context()
-            self._socket = self._context.socket(zmq.PUB)
-            _configure_publisher_socket(self._socket, high_water_mark, max_message_bytes)
-            self._socket.zap_domain = _ZAP_DOMAIN.encode("ascii")
-            self._socket.curve_publickey = credentials.public_key
-            self._socket.curve_secretkey = credentials.secret_key
-            self._socket.curve_server = True
-
-            self._authenticator = ThreadAuthenticator(self._context)
-            self._authenticator.configure_curve_callback(
-                domain=_ZAP_DOMAIN,
-                credentials_provider=_MarketPrincipalRegistry(self._principals),
-            )
-            self._authenticator.start()
-            self._socket.bind(endpoint)
-            actual_endpoint = self._socket.getsockopt(zmq.LAST_ENDPOINT)
-            self.endpoint = actual_endpoint.decode("utf-8", errors="strict")
+            self._open(endpoint)
         except BaseException:
             try:
                 self.close()
             except BaseException:
                 raise ServiceTransportStartupCleanupError(self) from None
             raise
+
+    def _open(self, endpoint: str) -> None:
+        if self._grants is None:
+            self._socket = self._context.socket(zmq.PUB)
+        else:
+            self._socket = self._context.socket(zmq.XPUB)
+            self._socket.setsockopt(zmq.XPUB_MANUAL, 1)
+            # Every subscribe/unsubscribe of every peer reaches the
+            # authorization check, including repeats of an existing topic.
+            self._socket.setsockopt(zmq.XPUB_VERBOSER, 1)
+        _configure_publisher_socket(self._socket, self._high_water_mark, self._max_message_bytes)
+        self._socket.zap_domain = _ZAP_DOMAIN.encode("ascii")
+        self._socket.curve_publickey = self._credentials.public_key
+        self._socket.curve_secretkey = self._credentials.secret_key
+        self._socket.curve_server = True
+
+        self._authenticator = ThreadAuthenticator(self._context)
+        self._authenticator.configure_curve_callback(
+            domain=_ZAP_DOMAIN,
+            credentials_provider=_MarketPrincipalRegistry(self._principals),
+        )
+        self._authenticator.start()
+        self._socket.bind(endpoint)
+        actual_endpoint = self._socket.getsockopt(zmq.LAST_ENDPOINT)
+        self.endpoint = actual_endpoint.decode("utf-8", errors="strict")
+
+    def pump_subscriptions(self, max_requests: int = 256) -> int:
+        """Authorize pending subscription requests; return how many were read.
+
+        Only for a publisher with ``stream_grants``. ``try_publish`` calls it
+        before every send, so a granted subscriber starts receiving with the
+        next published event.
+        """
+
+        self._check_thread()
+        if self._grants is None or self._socket is None:
+            return 0
+        handled = 0
+        while handled < max_requests:
+            try:
+                frame = self._socket.recv(flags=zmq.NOBLOCK, copy=False)
+            except zmq.Again:
+                break
+            handled += 1
+            request = bytes(frame.bytes)
+            if not request or request[0] not in (0, 1):
+                self.denied_subscriptions += 1
+                continue
+            topic = request[1:]
+            if request[0] == 0:
+                self._socket.setsockopt(zmq.UNSUBSCRIBE, topic)
+                continue
+            try:
+                user_id = frame.get("User-Id")
+            except zmq.ZMQError:
+                user_id = None
+            principal = (
+                self._principals.get(user_id.encode("ascii"))
+                if type(user_id) is str and user_id.isascii()
+                else None
+            )
+            stream_id = _stream_id_for_topic(topic)
+            if (
+                principal is None
+                or stream_id is None
+                or stream_id not in self._grants.get(principal, frozenset())
+            ):
+                self.denied_subscriptions += 1
+                continue
+            # Manual XPUB: this subscription applies to the peer that sent it.
+            self._socket.setsockopt(zmq.SUBSCRIBE, topic)
+        return handled
+
+    @property
+    def enforced_stream_grants(self) -> Mapping[str, frozenset[str]] | None:
+        """Immutable configured grants only while the XPUB socket is live.
+
+        This describes transport configuration, not a delivery receipt or a
+        claim about upstream account/market authority. XPUB_MANUAL is set as
+        a required option during construction; failed construction cannot
+        expose this property as an active partitioned publisher.
+        """
+
+        self._check_thread()
+        if self._closed or self._close_pending or self._socket is None or self._grants is None:
+            return None
+        if self._socket.getsockopt(zmq.TYPE) != zmq.XPUB:
+            return None
+        return self._grants
+
+    def reconfigure(
+        self,
+        principals: Mapping[bytes, str],
+        *,
+        stream_grants: Mapping[str, object] | None,
+    ) -> None:
+        """Replace the audience and stream grants (revocation included).
+
+        The socket is rebuilt on the same endpoint: every peer reconnects,
+        passes CURVE/ZAP against the new audience (a removed key is refused)
+        and has its subscriptions authorized against the new grants. Events
+        published while peers reconnect are not delivered to them. Messages
+        already delivered to a peer cannot be recalled; a caller must also
+        enforce a control-plane authorization epoch and invalidate buffered
+        old-epoch observations before claiming a revocation is complete.
+
+        If socket shutdown or replacement fails, the publisher remains
+        close-pending and refuses further publishes; close may be retried.
+        """
+
+        self._check_thread()
+        if self._closed or self._close_pending:
+            raise RuntimeError("market publisher is closed")
+        copied = _copy_principals(principals)
+        if not copied:
+            raise ValueError("market publisher audience must not be empty")
+        grants = _copy_stream_grants(stream_grants, copied, self._wire_version)
+        if (grants is None) != (self._grants is None):
+            raise ValueError("reconfigure cannot switch stream authorization on or off")
+        endpoint = self.endpoint
+        self._close_pending = True
+        self._close_socket()
+        self._principals = copied
+        self._grants = grants
+        # Any partially opened replacement remains owned for close() if this
+        # fails; close-pending prevents sending through an unbound socket.
+        self._open(endpoint)
+        self._close_pending = False
+
+    def _close_socket(self) -> None:
+        authenticator = self._authenticator
+        if authenticator is not None:
+            authenticator.stop()
+            self._authenticator = None
+        socket = self._socket
+        if socket is not None:
+            socket.close(linger=0)
+            self._socket = None
 
     def publish(self, event: WireEnvelope) -> None:
         """Queue one validated event through the neutral publisher contract."""
@@ -376,6 +510,8 @@ class ZmqMarketPublisher:
             raise RuntimeError("market publisher is closed")
         _validate_market_event(event, self._identity, self._scope)
         encoded = encode_envelope(event, max_bytes=self._max_message_bytes)
+        if self._grants is not None:
+            self.pump_subscriptions()
         try:
             if self._wire_version == MARKET_WIRE_VERSION_LEGACY:
                 self._socket.send(encoded, flags=zmq.NOBLOCK)
@@ -394,14 +530,7 @@ class ZmqMarketPublisher:
             return
         self._check_thread()
         self._close_pending = True
-        authenticator = self._authenticator
-        if authenticator is not None:
-            authenticator.stop()
-            self._authenticator = None
-        socket = self._socket
-        if socket is not None:
-            socket.close(linger=0)
-            self._socket = None
+        self._close_socket()
         context = self._context
         if context is not None:
             context.term()
@@ -460,6 +589,7 @@ class ZmqMarketSubscriber:
         self._max_message_bytes = max_message_bytes
         self._wire_version = wire_version
         self._subscription_key = subscription_key
+        self._key_cache: list = []  # [last accepted raw key, its parsed key]
         self._topic = (
             _market_topic_for_stream_id(subscription_key.stream_id)
             if wire_version == MARKET_WIRE_VERSION_TOPIC_FILTERED
@@ -558,9 +688,10 @@ class ZmqMarketSubscriber:
             return None
         try:
             event = decode_envelope(bytes(frame), max_bytes=self._max_message_bytes)
-            _validate_market_event(event, self._expected_peer, self._expected_scope)
+            actual_key = _validate_market_event(
+                event, self._expected_peer, self._expected_scope, self._key_cache
+            )
             if self._subscription_key is not None:
-                actual_key = MarketSubscriptionKey.from_dict(event.payload["key"])
                 if (
                     event.header.stream_id != self._subscription_key.stream_id
                     or actual_key != self._subscription_key
@@ -607,7 +738,8 @@ def _validate_market_event(
     event: WireEnvelope,
     expected_identity: WireIdentity,
     expected_scope: WireScope,
-) -> None:
+    key_cache: list | None = None,
+) -> MarketSubscriptionKey:
     if type(event) is not WireEnvelope:
         raise ValueError("market event must be a WireEnvelope")
     header = event.header
@@ -622,14 +754,24 @@ def _validate_market_event(
         raise ValueError("market event schema or operation is unsupported")
     if set(event.payload) != {"key", "data"}:
         raise ValueError("market event payload must contain exactly key and data")
-    try:
-        key = MarketSubscriptionKey.from_dict(event.payload["key"])
-    except (TypeError, ValueError):
-        raise ValueError("market event subscription key is invalid") from None
+    raw_key = event.payload["key"]
+    if key_cache is not None and key_cache and key_cache[0] == raw_key:
+        # Same published key as the last accepted event: parsing is
+        # deterministic, so the parsed key is reused (equal input, equal
+        # result; the frozen payload cannot change after decode).
+        key = key_cache[1]
+    else:
+        try:
+            key = MarketSubscriptionKey.from_dict(raw_key)
+        except (TypeError, ValueError):
+            raise ValueError("market event subscription key is invalid") from None
+        if key_cache is not None:
+            key_cache[:] = [raw_key, key]
     if header.stream_id != key.stream_id:
         raise ValueError("market event stream does not match its subscription key")
     if not isinstance(event.payload["data"], Mapping):
         raise ValueError("market event data must be an object")
+    return key
 
 
 def _validate_subscriber_configuration(
@@ -720,6 +862,49 @@ def _market_topic_for_stream_id(stream_id: str) -> bytes:
     ):
         raise ValueError("market topic requires a canonical subscription stream ID")
     return _TOPIC_FILTERED_FRAME_PREFIX + stream_id.encode("ascii") + b"\x00"
+
+
+def _stream_id_for_topic(topic: bytes) -> str | None:
+    """The canonical stream ID of an exact v2 topic frame, else ``None``."""
+
+    prefix = _TOPIC_FILTERED_FRAME_PREFIX
+    if not topic.startswith(prefix) or not topic.endswith(b"\x00"):
+        return None
+    try:
+        stream_id = topic[len(prefix) : -1].decode("ascii")
+        if _market_topic_for_stream_id(stream_id) != topic:
+            return None
+    except (UnicodeDecodeError, ValueError):
+        return None
+    return stream_id
+
+
+def _copy_stream_grants(
+    grants: Mapping[str, object] | None,
+    principals: Mapping[bytes, str],
+    wire_version: int,
+) -> Mapping[str, frozenset[str]] | None:
+    """Validate ``principal_ref -> stream IDs``; ``None`` keeps audience-only ACL."""
+
+    if grants is None:
+        return None
+    if wire_version != MARKET_WIRE_VERSION_TOPIC_FILTERED:
+        raise ValueError("stream grants require the topic-filtered market wire version")
+    if not isinstance(grants, Mapping):
+        raise ValueError("stream grants must map principal references to stream IDs")
+    known = set(principals.values())
+    copied: dict[str, frozenset[str]] = {}
+    for principal_ref, stream_ids in grants.items():
+        _validate_principal_ref(principal_ref)
+        if principal_ref not in known:
+            raise ValueError("stream grant names a principal outside the audience")
+        if isinstance(stream_ids, (str, bytes)) or not hasattr(stream_ids, "__iter__"):
+            raise ValueError("stream grants must be collections of stream IDs")
+        items = frozenset(stream_ids)
+        for stream_id in items:
+            _market_topic_for_stream_id(stream_id)  # canonical stream IDs only
+        copied[principal_ref] = items
+    return MappingProxyType(copied)
 
 
 def _copy_principals(principals: Mapping[bytes, str]) -> Mapping[bytes, str]:

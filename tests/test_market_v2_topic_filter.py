@@ -483,6 +483,7 @@ def _fake_subscriber(
     key: MarketSubscriptionKey,
 ) -> ZmqMarketSubscriber:
     subscriber = object.__new__(ZmqMarketSubscriber)
+    subscriber._key_cache = []
     subscriber._endpoint = "tcp://127.0.0.1:1"
     subscriber.endpoint = subscriber._endpoint
     subscriber._expected_peer = _IDENTITY
