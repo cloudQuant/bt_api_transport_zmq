@@ -1,6 +1,7 @@
 # bt_api_transport_zmq
 
-`bt_api_transport_zmq` is a provider-neutral transport boundary. It owns a
+`bt_api_transport_zmq` is the default Gateway transport, installed by the SDK
+`gateway` extra. It is a provider-neutral transport boundary. It owns a
 small versioned JSON wire format, ZeroMQ socket safety, bounded buffering,
 message sequencing, and authenticated server-side command delivery. It does
 not own order state, risk state, provider execution policy, or retry policy.
@@ -53,3 +54,13 @@ subscription. Topic filtering reduces delivery work; it is not authorization.
 CURVE authentication and the publisher's finite principal ACL remain required
 for both versions. High-water marks and envelope size limits apply in either
 version.
+
+## Extension boundary
+
+New middleware, if needed later, belongs in a new transport package implementing
+the neutral SDK/Base service contracts. Gateway owns account sessions, command
+state, durable dispatch and recovery; this package owns ZeroMQ communication,
+authentication and bounded delivery. Transport and Gateway may evolve through
+explicit breaking changes with matched contracts and integration checks. A new
+transport must preserve outcome-unknown and scope semantics, not silently
+translate a timeout into an unsent write.
