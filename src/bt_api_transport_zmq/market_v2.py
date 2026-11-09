@@ -25,6 +25,7 @@ import os
 import threading
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Optional
 
@@ -58,6 +59,24 @@ DEFAULT_HIGH_WATER_MARK = 1000
 DEFAULT_MAX_MESSAGE_BYTES = 1024 * 1024
 MAX_PRINCIPALS = 4096
 MAX_DRAIN_FRAMES_PER_CALL = 64
+
+
+@dataclass(frozen=True)
+class MarketFrameReceipt:
+    """Local application socket-read time for one validated market envelope.
+
+    This records when the application read the ZMQ frame, not when the kernel
+    received a packet, and never establishes provider clock or venue authority.
+    """
+
+    stream_id: str
+    stream_epoch: str
+    sequence: int
+    message_id: str
+    received_wall_ns: int
+    received_monotonic_ns: int
+    pid: int
+    thread_id: int
 _MAX_SOCKET_OPTION_INT = 2_147_483_647
 _ZAP_DOMAIN = "bt-api-market-v2"
 MARKET_WIRE_VERSION_LEGACY = 1
@@ -653,6 +672,7 @@ class ZmqMarketSubscriber:
         self._credentials = credentials
         self._owner_pid = os.getpid()
         self._owner_thread = threading.get_ident()
+        self._last_receive_receipt: MarketFrameReceipt | None = None
         # Receiver-side authorization state (iteration 60, G2): after
         # ``revoke`` every frame is dropped until ``regrant`` names the new
         # authorization cut; frames of that epoch at or below it are stale
@@ -717,6 +737,7 @@ class ZmqMarketSubscriber:
         """
 
         self._check_thread()
+        self._last_receive_receipt = None
         if self._closed or self._close_pending:
             raise RuntimeError("market subscriber is closed")
         if timeout is not None and timeout_ms is not None:
@@ -751,6 +772,10 @@ class ZmqMarketSubscriber:
                 # Ready but nothing readable: reported as before (v1 None,
                 # v2 counted as an invalid drop).
                 received = None
+        # This samples immediately after the owning thread has read the frame,
+        # before parsing/authentication. Only publish it for a validated frame.
+        received_wall_ns = time.time_ns()
+        received_monotonic_ns = time.monotonic_ns()
         if self._wire_version == MARKET_WIRE_VERSION_LEGACY:
             frame = received
         else:
@@ -791,7 +816,23 @@ class ZmqMarketSubscriber:
         ):
             self.dropped_stale_authorization += 1
             return None
+        self._last_receive_receipt = MarketFrameReceipt(
+            stream_id=event.header.stream_id,
+            stream_epoch=event.header.stream_epoch,
+            sequence=event.header.sequence,
+            message_id=event.header.message_id,
+            received_wall_ns=received_wall_ns,
+            received_monotonic_ns=received_monotonic_ns,
+            pid=self._owner_pid,
+            thread_id=self._owner_thread,
+        )
         return event
+
+    @property
+    def last_receive_receipt(self) -> MarketFrameReceipt | None:
+        """Receipt for the latest successful ``receive``, on its owner thread."""
+        self._check_thread()
+        return self._last_receive_receipt
 
     @property
     def revoked(self) -> str | None:
@@ -838,6 +879,7 @@ class ZmqMarketSubscriber:
         if self._closed:
             return
         self._check_thread()
+        self._last_receive_receipt = None
         self._close_pending = True
         socket = self._socket
         if socket is not None:

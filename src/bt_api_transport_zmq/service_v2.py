@@ -19,6 +19,7 @@ import time
 import uuid
 from collections.abc import Callable, Mapping
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import Any, Optional
@@ -102,6 +103,20 @@ class _BoundedMultipartReceiver:
 
 class ServiceTransportError(RuntimeError):
     """The authenticated v2 transport could not safely process an operation."""
+
+
+@dataclass(frozen=True)
+class ServiceReplyReceipt:
+    """Local application socket-read time for one authenticated RPC reply."""
+
+    request_message_id: str
+    reply_message_id: str
+    correlation_id: str
+    operation: str
+    received_wall_ns: int
+    received_monotonic_ns: int
+    pid: int
+    thread_id: int
 
 
 class ServiceTransportStartupCleanupError(ServiceTransportError):
@@ -521,6 +536,7 @@ class ZmqServiceClient:
         self._reply_box = SealedBox(reply_private_key)
         self._owner_pid = os.getpid()
         self._owner_thread = threading.get_ident()
+        self._last_reply_receipt: ServiceReplyReceipt | None = None
         self._closed = False
         self._close_pending = False
         self._inflight = False
@@ -549,6 +565,7 @@ class ZmqServiceClient:
         """Send one request and return only its correctly bound service reply."""
 
         self._check_thread()
+        self._last_reply_receipt = None
         if self._closed or self._close_pending:
             raise RuntimeError("client is closed")
         if self._inflight:
@@ -594,6 +611,11 @@ class ZmqServiceClient:
                 frames = self._receiver.receive(1)
                 if frames is None or len(frames) != 1:
                     continue
+                # The owning thread has read this frame, but has not yet
+                # decrypted or validated it. Never publish a receipt until the
+                # reply has passed all correlation and authentication checks.
+                received_wall_ns = time.time_ns()
+                received_monotonic_ns = time.monotonic_ns()
                 raw_reply = bytes(frames[0])
                 if (
                     len(raw_reply) > self._max_message_bytes
@@ -615,6 +637,16 @@ class ZmqServiceClient:
                     validate_reply(reply, request, expected_peer=self._identity)
                 except WireValidationError as exc:
                     raise RequestOutcomeUnknownError(message_id, "reply_validation_failed") from exc
+                self._last_reply_receipt = ServiceReplyReceipt(
+                    request_message_id=message_id,
+                    reply_message_id=reply.header.message_id,
+                    correlation_id=reply.header.correlation_id,
+                    operation=reply.header.operation,
+                    received_wall_ns=received_wall_ns,
+                    received_monotonic_ns=received_monotonic_ns,
+                    pid=self._owner_pid,
+                    thread_id=self._owner_thread,
+                )
                 return reply
         except RequestOutcomeUnknownError:
             self._last_uncertain_message_id = message_id
@@ -641,12 +673,19 @@ class ZmqServiceClient:
         finally:
             self._inflight = False
 
+    @property
+    def last_reply_receipt(self) -> ServiceReplyReceipt | None:
+        """Receipt for the latest validated reply, only on the owner thread."""
+        self._check_thread()
+        return self._last_reply_receipt
+
     def close(self) -> None:
         """Close owned resources in order; retry a failed stage on this thread."""
 
         if self._closed:
             return
         self._check_thread()
+        self._last_reply_receipt = None
         self._close_pending = True
         self._retire_socket()
         lease = self._context_lease
